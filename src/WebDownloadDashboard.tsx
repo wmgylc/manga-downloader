@@ -239,14 +239,14 @@ export default defineComponent({
                         {groupedTasks.value[group.key].length}
                       </NTag>
                     </div>
-                    <div class="grid gap-2">
+                    <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                       {groupedTasks.value[group.key].map((task) => (
                         <NCard
                           key={task.id}
                           bordered={false}
                           class="overflow-hidden border border-solid border-[#d8ddd4] bg-white/94 transition-colors hover:border-[#95aaa0]">
-                          <div class="grid gap-4 md:grid-cols-[6rem_minmax(0,1fr)_9rem] md:items-start">
-                            <div class="h-32 w-24 overflow-hidden border border-solid border-[#e3e6df] bg-[#eef1ec] md:h-34 md:w-24">
+                          <div class="flex gap-4">
+                            <div class="h-36 w-25 shrink-0 overflow-hidden border border-solid border-[#e3e6df] bg-[#eef1ec]">
                               {task.cover ? (
                                 <NImage
                                   src={task.cover}
@@ -258,7 +258,7 @@ export default defineComponent({
                                 <div class="flex h-full items-center justify-center text-xs text-[#7b8981]">无封面</div>
                               )}
                             </div>
-                            <div class="min-w-0">
+                            <div class="min-w-0 flex-1">
                               <div class="mb-2 flex flex-wrap items-center gap-2">
                                 <NTag type={statusMeta(task.status).tagType} bordered={false} size="small">
                                   {statusMeta(task.status).label}
@@ -282,19 +282,12 @@ export default defineComponent({
                                   height={6}
                                 />
                               </div>
-                              <div class="mt-2 text-sm text-[#52615a]">
-                                {task.completedPages}
-                                {task.totalPages ? ` / ${task.totalPages}` : ''} 页
-                              </div>
-                            </div>
-                            <div class="grid grid-cols-2 gap-2 border-0 border-t border-solid border-[#edf0ea] pt-3 text-xs md:block md:border-t-0 md:pt-0">
-                              <div>
-                                <div class="font-700 uppercase tracking-[0.08em] text-[#7b8981]">更新</div>
-                                <div class="mt-1 font-700 tabular-nums text-[#2d3934]">{formatTime(task.updatedAt)}</div>
-                              </div>
-                              <div class="md:mt-4">
-                                <div class="font-700 uppercase tracking-[0.08em] text-[#7b8981]">完成</div>
-                                <div class="mt-1 font-700 tabular-nums text-[#2d3934]">{formatTime(task.finishedAt)}</div>
+                              <div class="mt-2 flex flex-wrap items-center justify-between gap-2 text-sm text-[#52615a]">
+                                <span>
+                                  {task.completedPages}
+                                  {task.totalPages ? ` / ${task.totalPages}` : ''} 页
+                                </span>
+                                <span class="text-xs text-[#7b8981]">更新 {formatTime(task.updatedAt)}</span>
                               </div>
                             </div>
                           </div>
