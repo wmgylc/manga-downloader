@@ -1,5 +1,11 @@
 body {
     @apply m-0;
+    background: #f7f5ef;
+    font-family: Avenir Next, Helvetica Neue, Helvetica, Arial, PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif;
+}
+
+* {
+    box-sizing: border-box;
 }
 
 .selection-area {

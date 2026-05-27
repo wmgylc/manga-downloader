@@ -6,7 +6,6 @@ import {
   NImage,
   NInput,
   NProgress,
-  NSpace,
   NTag,
   useMessage,
 } from 'naive-ui'
@@ -42,6 +41,17 @@ const TASK_GROUPS: Array<{
   { key: 'failed', label: '下载失败', tagType: 'error' },
 ]
 
+const PROVIDER_MARKERS = [
+  'jm:',
+  'jmcomic',
+  'jm-comic',
+  '18comic',
+  'jmapiproxy',
+  'cdnzack',
+  'cdnhth',
+  'cdnbea',
+]
+
 export default defineComponent({
   name: 'WebDownloadDashboard',
   setup() {
@@ -73,6 +83,12 @@ export default defineComponent({
       success: sortedTasks.value.filter((task) => task.status === 'success'),
       failed: sortedTasks.value.filter((task) => task.status === 'failed'),
     }))
+    const totalPages = computed(() =>
+      sortedTasks.value.reduce((total, task) => total + (task.totalPages ?? 0), 0),
+    )
+    const completedPages = computed(() =>
+      sortedTasks.value.reduce((total, task) => total + task.completedPages, 0),
+    )
 
     async function loadTasks() {
       try {
@@ -117,20 +133,30 @@ export default defineComponent({
     function providerMeta(task: DownloadTask) {
       const lower = task.target.toLowerCase()
       const provider =
-        task.provider ??
-        (lower.startsWith('jm:') ||
-        lower.includes('jmcomic') ||
-        lower.includes('jm-comic') ||
-        lower.includes('18comic') ||
-        lower.includes('jmapiproxy') ||
-        lower.includes('cdnzack') ||
-        lower.includes('cdnhth') ||
-        lower.includes('cdnbea')
-          ? 'jmcomic'
-          : 'wnacg')
+        task.provider ?? (PROVIDER_MARKERS.some((marker) => lower.includes(marker)) ? 'jmcomic' : 'wnacg')
       return provider === 'jmcomic'
         ? { label: 'JMComic', type: 'info' as const }
         : { label: 'WNACG', type: 'default' as const }
+    }
+
+    function formatTime(value?: string) {
+      if (!value) {
+        return '-'
+      }
+      const timestamp = Number(value)
+      if (!Number.isFinite(timestamp)) {
+        return '-'
+      }
+      return new Intl.DateTimeFormat('zh-CN', {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      }).format(new Date(timestamp * 1000))
+    }
+
+    function taskTitle(task: DownloadTask) {
+      return task.title || task.target
     }
 
     onMounted(async () => {
@@ -145,97 +171,139 @@ export default defineComponent({
     })
 
     return () => (
-      <div class="min-h-screen bg-[radial-gradient(circle_at_top,#fff7ed_0%,#fff 38%,#f8fafc_100%)] text-slate-900">
-        <div class="mx-auto max-w-6xl px-4 py-8 md:px-8">
-          <div class="mb-8 overflow-hidden rounded-6 border border-solid border-orange-200 bg-white/88 p-6 shadow-[0_24px_80px_rgba(15,23,42,0.08)] backdrop-blur">
-            <div class="mb-6 flex flex-col gap-3 md:flex-row">
-              <NInput
-                value={url.value}
-                onUpdate:value={(value) => (url.value = value)}
-                placeholder="输入任意页或漫画详情页 URL"
-                size="large"
-                onKeydown={(event: KeyboardEvent) => {
-                  if (event.key === 'Enter') {
-                    void startDownload()
-                  }
-                }}
-              />
-              <NButton type="primary" size="large" loading={submitting.value} onClick={() => void startDownload()}>
-                开始下载
-              </NButton>
+      <div class="min-h-screen bg-[#f7f5ef] bg-[linear-gradient(rgba(35,48,44,0.045)_1px,transparent_1px),linear-gradient(90deg,rgba(35,48,44,0.045)_1px,transparent_1px)] bg-[size:28px_28px] px-4 py-5 text-[#14201c] md:px-8 md:py-8">
+        <div class="mx-auto max-w-7xl">
+          <section class="mb-5 grid overflow-hidden border border-solid border-[#d8ddd4] bg-white/92 md:grid-cols-[1.35fr_0.65fr]">
+            <div class="border-0 border-b border-solid border-[#d8ddd4] p-5 md:border-b-0 md:border-r">
+              <div class="mb-3 text-xs font-700 uppercase tracking-[0.14em] text-[#69776f]">下载目标</div>
+              <div class="flex flex-col gap-3 md:flex-row">
+                <NInput
+                  value={url.value}
+                  onUpdate:value={(value) => (url.value = value)}
+                  placeholder="输入漫画 ID 或 URL"
+                  size="large"
+                  onKeydown={(event: KeyboardEvent) => {
+                    if (event.key === 'Enter') {
+                      void startDownload()
+                    }
+                  }}
+                  class="min-w-0 flex-1"
+                />
+                <NButton
+                  type="primary"
+                  size="large"
+                  loading={submitting.value}
+                  class="min-w-32"
+                  onClick={() => void startDownload()}>
+                  开始下载
+                </NButton>
+              </div>
             </div>
-          </div>
+            <div class="grid grid-cols-3 divide-x divide-solid divide-[#d8ddd4] md:grid-cols-1 md:divide-x-0 md:divide-y">
+              {TASK_GROUPS.map((group) => (
+                <div key={group.key} class="px-4 py-3">
+                  <div class="text-xs font-700 uppercase tracking-[0.12em] text-[#69776f]">{group.label}</div>
+                  <div class="mt-1 text-2xl font-800 tabular-nums text-[#14201c]">
+                    {groupedTasks.value[group.key].length}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
 
-          <div class="mb-4 flex items-center justify-between">
-            <div class="text-xl font-700">任务列表</div>
+          <div class="mb-3 flex flex-col gap-2 border-0 border-b border-solid border-[#ccd4ce] pb-3 md:flex-row md:items-end md:justify-between">
+            <div>
+              <div class="text-xl font-800 tracking-tight">任务列表</div>
+              <div class="mt-1 text-sm text-[#69776f]">
+                {sortedTasks.value.length} 个任务 · {completedPages.value}
+                {totalPages.value ? ` / ${totalPages.value}` : ''} 页
+              </div>
+            </div>
+            <NButton size="small" quaternary class="self-start md:self-auto" onClick={() => void loadTasks()}>
+              刷新
+            </NButton>
           </div>
 
           {sortedTasks.value.length === 0 ? (
-            <NCard bordered={false} class="rounded-6 shadow-[0_10px_40px_rgba(15,23,42,0.06)]">
+            <NCard bordered={false} class="border border-solid border-[#d8ddd4] bg-white/92">
               <NEmpty description="还没有下载任务" />
             </NCard>
           ) : (
-            <div class="space-y-8">
+            <div class="space-y-6">
               {TASK_GROUPS.map((group) =>
                 groupedTasks.value[group.key].length > 0 ? (
                   <section key={group.key}>
-                    <div class="mb-3 flex items-center gap-3">
-                      <div class="text-lg font-700">{group.label}</div>
-                      <NTag bordered={false} type={group.tagType}>
+                    <div class="mb-2 flex items-center gap-2">
+                      <div class="text-sm font-800 uppercase tracking-[0.12em] text-[#14201c]">{group.label}</div>
+                      <NTag bordered={false} size="small" type={group.tagType}>
                         {groupedTasks.value[group.key].length}
                       </NTag>
                     </div>
-                    <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                    <div class="grid gap-2">
                       {groupedTasks.value[group.key].map((task) => (
                         <NCard
                           key={task.id}
                           bordered={false}
-                          class="overflow-hidden rounded-6 border border-solid border-slate-200 shadow-[0_18px_50px_rgba(15,23,42,0.08)]">
-                          <div class="mb-4 flex gap-4">
-                            <div class="h-36 w-25 shrink-0 overflow-hidden rounded-4 bg-slate-100">
+                          class="overflow-hidden border border-solid border-[#d8ddd4] bg-white/94 transition-colors hover:border-[#95aaa0]">
+                          <div class="grid gap-4 md:grid-cols-[6rem_minmax(0,1fr)_9rem] md:items-start">
+                            <div class="h-32 w-24 overflow-hidden border border-solid border-[#e3e6df] bg-[#eef1ec] md:h-34 md:w-24">
                               {task.cover ? (
                                 <NImage
                                   src={task.cover}
-                                  alt={task.title || task.target}
+                                  alt={taskTitle(task)}
                                   preview-disabled
                                   class="h-full w-full object-cover"
                                 />
                               ) : (
-                                <div class="flex h-full items-center justify-center text-xs text-slate-400">无封面</div>
+                                <div class="flex h-full items-center justify-center text-xs text-[#7b8981]">无封面</div>
                               )}
                             </div>
-                            <div class="min-w-0 flex-1">
-                              <NSpace align="center">
-                                <NTag type={statusMeta(task.status).tagType} bordered={false}>
+                            <div class="min-w-0">
+                              <div class="mb-2 flex flex-wrap items-center gap-2">
+                                <NTag type={statusMeta(task.status).tagType} bordered={false} size="small">
                                   {statusMeta(task.status).label}
                                 </NTag>
-                                <NTag type={providerMeta(task).type} bordered={false}>
+                                <NTag type={providerMeta(task).type} bordered={false} size="small">
                                   {providerMeta(task).label}
                                 </NTag>
-                              </NSpace>
-                              <div class="mt-3 line-clamp-3 text-base font-700 leading-snug">
-                                {task.title || task.target}
                               </div>
-                              <div class="mt-2 text-sm text-slate-500">
-                                已下载 {task.completedPages}
+                              <div class="line-clamp-2 text-base font-800 leading-snug text-[#14201c]">
+                                {taskTitle(task)}
+                              </div>
+                              <div class="mt-2 truncate font-mono text-xs text-[#69776f]">{task.target}</div>
+                              <div class="mt-3">
+                                <NProgress
+                                  percentage={progressPercentage(task)}
+                                  processing={task.status === 'downloading'}
+                                  status={
+                                    task.status === 'failed' ? 'error' : task.status === 'success' ? 'success' : 'info'
+                                  }
+                                  show-indicator={false}
+                                  height={6}
+                                />
+                              </div>
+                              <div class="mt-2 text-sm text-[#52615a]">
+                                {task.completedPages}
                                 {task.totalPages ? ` / ${task.totalPages}` : ''} 页
+                              </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-2 border-0 border-t border-solid border-[#edf0ea] pt-3 text-xs md:block md:border-t-0 md:pt-0">
+                              <div>
+                                <div class="font-700 uppercase tracking-[0.08em] text-[#7b8981]">更新</div>
+                                <div class="mt-1 font-700 tabular-nums text-[#2d3934]">{formatTime(task.updatedAt)}</div>
+                              </div>
+                              <div class="md:mt-4">
+                                <div class="font-700 uppercase tracking-[0.08em] text-[#7b8981]">完成</div>
+                                <div class="mt-1 font-700 tabular-nums text-[#2d3934]">{formatTime(task.finishedAt)}</div>
                               </div>
                             </div>
                           </div>
 
-                          <NProgress
-                            percentage={progressPercentage(task)}
-                            processing={task.status === 'downloading'}
-                            status={
-                              task.status === 'failed' ? 'error' : task.status === 'success' ? 'success' : 'info'
-                            }
-                            show-indicator={false}
-                          />
-
                           {task.error && (
-                            <div class="mt-4 rounded-4 bg-rose-50 px-3 py-2 text-sm text-rose-700">{task.error}</div>
+                            <div class="mt-3 border border-solid border-[#f1c7c7] bg-[#fff4f2] px-3 py-2 text-sm text-[#9a2e2e]">
+                              {task.error}
+                            </div>
                           )}
-
                         </NCard>
                       ))}
                     </div>
