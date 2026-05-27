@@ -1,4 +1,4 @@
-# WNACG Downloader Service
+# Manga Downloader Service
 
 一个用于 WNACG 与 JMComic 下载的网页与 HTTP 服务。
 
@@ -47,8 +47,8 @@ http://127.0.0.1:3001/api/health
 └── src-tauri/
     ├── Cargo.toml
     └── src/
-        ├── bin/wnacg-api.rs
-        ├── bin/wnacg-cli.rs
+        ├── bin/manga-api.rs
+        ├── bin/manga-cli.rs
         ├── cli.rs
         ├── config.rs
         ├── errors.rs
@@ -89,13 +89,13 @@ docker compose -f docker-compose.cli.yml up -d --build
 任务历史默认持久化到：
 
 ```text
-/data/wnacg-tasks.sqlite
+/data/manga-tasks.sqlite
 ```
 
 如果发现旧的：
 
 ```text
-/data/wnacg-tasks.json
+/data/manga-tasks.json
 ```
 
 服务会在首次启动时自动导入。

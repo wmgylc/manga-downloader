@@ -1,12 +1,12 @@
 [package]
-name = "wnacg-downloader"
+name = "manga-downloader"
 version = "0.1.0"
-description = "WNACG downloader HTTP service"
+description = "Manga downloader HTTP service"
 authors = ["wmgylc"]
 edition = "2021"
 
 [lib]
-name = "wnacg_downloader_lib"
+name = "manga_downloader_lib"
 crate-type = ["rlib"]
 
 [dependencies]

@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 FROM node:20-bookworm AS web-builder
 
 WORKDIR /app
@@ -29,7 +31,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . .
 
 WORKDIR /app/src-tauri
-RUN cargo build --release --bin wnacg-cli --bin wnacg-api
+RUN --mount=type=cache,id=manga-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=manga-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=manga-cargo-target,target=/app/src-tauri/target \
+    cargo build --release --bin manga-cli --bin manga-api \
+    && mkdir -p /app/release-bin \
+    && cp target/release/manga-cli target/release/manga-api /app/release-bin/
 
 FROM debian:bookworm-slim AS runtime
 
@@ -47,12 +54,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN mkdir -p /config /data
 
-COPY --from=builder /app/src-tauri/target/release/wnacg-cli /usr/local/libexec/wnacg-worker
-COPY --from=builder /app/src-tauri/target/release/wnacg-api /usr/local/bin/wnacg-api
-COPY --from=web-builder /app/dist /usr/local/share/wnacg-web
+COPY --from=builder /app/release-bin/manga-cli /usr/local/libexec/manga-worker
+COPY --from=builder /app/release-bin/manga-api /usr/local/bin/manga-api
+COPY --from=web-builder /app/dist /usr/local/share/manga-web
 
 VOLUME ["/data"]
 
 EXPOSE 3000
 
-CMD ["wnacg-api"]
+CMD ["manga-api"]

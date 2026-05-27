@@ -476,7 +476,23 @@ impl JmClient {
                 })
             }
             JmTarget::Chapter(chapter_id) => {
-                let chapter = self.get_chapter(chapter_id).await?;
+                let chapter = match self.get_chapter(chapter_id).await {
+                    Ok(chapter) => chapter,
+                    Err(chapter_err) => {
+                        let comic = self.get_comic(chapter_id).await.with_context(|| {
+                            format!(
+                                "按章节 ID 获取 JMComic `{chapter_id}` 失败，按专辑 ID 重试也失败: {chapter_err}"
+                            )
+                        })?;
+                        let selected = selected_chapter_ids(&comic, None);
+                        let chapters = self.fetch_chapters(selected).await?;
+                        return Ok(JmComicDetail {
+                            comic,
+                            selected_chapter_id: None,
+                            chapters,
+                        });
+                    }
+                };
                 let album_id = chapter
                     .series_id
                     .parse::<i64>()
@@ -795,7 +811,12 @@ fn parse_jm_target(input: &str) -> Option<JmTarget> {
                 return Some(JmTarget::Album(id));
             }
         }
-        if matches!(key.as_str(), "photo" | "chapter" | "photos") {
+        if key == "photo" {
+            if let Some(id) = parse_positive_i64(pair[1]) {
+                return Some(JmTarget::Album(id));
+            }
+        }
+        if matches!(key.as_str(), "chapter" | "photos") {
             if let Some(id) = parse_positive_i64(pair[1]) {
                 return Some(JmTarget::Chapter(id));
             }
@@ -1249,7 +1270,7 @@ mod tests {
     fn parses_chapter_urls() {
         assert_eq!(
             parse_jm_target("https://18comic.vip/photo/987654"),
-            Some(JmTarget::Chapter(987654))
+            Some(JmTarget::Album(987654))
         );
         assert_eq!(
             parse_jm_target("https://cdn-msp2.jmapiproxy2.cc/media/photos/456789/00001.webp"),

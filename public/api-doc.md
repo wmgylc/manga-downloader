@@ -1,4 +1,4 @@
-# WNACG Downloader API 文档
+# Manga Downloader API 文档
 
 这个服务同时提供网页界面和 HTTP GET 接口。
 

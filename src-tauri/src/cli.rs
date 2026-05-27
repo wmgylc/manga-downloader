@@ -27,7 +27,7 @@ use crate::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "wnacg-cli", about = "Search and download wnacg comics from the terminal")]
+#[command(name = "manga-cli", about = "Search and download manga from the terminal")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -578,7 +578,7 @@ async fn run_tasks(args: TasksArgs) -> anyhow::Result<()> {
 }
 
 async fn maybe_submit_download_task(args: &DownloadArgs) -> anyhow::Result<Option<String>> {
-    if std::env::var_os("WNACG_CLI_DISABLE_TASK_PROXY").is_some() {
+    if std::env::var_os("MANGA_CLI_DISABLE_TASK_PROXY").is_some() {
         return Ok(None);
     }
 
@@ -630,7 +630,7 @@ async fn maybe_submit_download_task(args: &DownloadArgs) -> anyhow::Result<Optio
 async fn fetch_task_api_json(task_id: Option<&str>) -> anyhow::Result<String> {
     let Some(api_base) = task_api_base() else {
         return Err(anyhow!(
-            "当前环境未配置 `WNACG_TASK_API_BASE`，无法查询统一任务中心"
+            "当前环境未配置 `MANGA_TASK_API_BASE`，无法查询统一任务中心"
         ));
     };
 
@@ -654,7 +654,7 @@ async fn fetch_task_api_json(task_id: Option<&str>) -> anyhow::Result<String> {
 }
 
 fn task_api_base() -> Option<String> {
-    std::env::var("WNACG_TASK_API_BASE")
+    std::env::var("MANGA_TASK_API_BASE")
         .ok()
         .filter(|value| !value.is_empty())
 }
@@ -1219,8 +1219,8 @@ fn looks_like_wn_api_domain(api_domain: &str) -> bool {
 fn load_cli_config(config_path: Option<&Path>) -> anyhow::Result<CliConfig> {
     let path = config_path
         .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("WNACG_CLI_CONFIG").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("/config/wnacg-cli.json"));
+        .or_else(|| std::env::var_os("MANGA_CLI_CONFIG").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/config/manga-cli.json"));
 
     if !path.exists() {
         return Ok(CliConfig::default());
