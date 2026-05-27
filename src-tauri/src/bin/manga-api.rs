@@ -143,6 +143,8 @@ struct CommandResponse {
 struct DownloadTask {
     id: String,
     target: String,
+    #[serde(default)]
+    provider: Option<String>,
     status: String,
     title: Option<String>,
     cover: Option<String>,
@@ -168,9 +170,11 @@ struct ComicInfo {
 
 impl DownloadTask {
     fn new(task_id: String, target: String, comic_info: Option<&ComicInfo>, now: String) -> Self {
+        let provider = Some(infer_provider(&target).to_string());
         Self {
             id: task_id,
             target,
+            provider,
             status: "downloading".to_string(),
             title: comic_info.map(|comic| comic.title.clone()),
             cover: comic_info.map(|comic| comic.cover.clone()),
@@ -189,21 +193,19 @@ impl DownloadTask {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let host = std::env::var("WNACG_API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let port = std::env::var("WNACG_API_PORT")
+    let host = std::env::var("MANGA_API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let port = std::env::var("MANGA_API_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(3000);
-    let cli_path = std::env::var("WNACG_CLI_PATH").unwrap_or_else(|_| "wnacg-cli".to_string());
-    let web_dist_path = std::env::var("WNACG_WEB_DIST_PATH")
+    let cli_path = std::env::var("MANGA_CLI_PATH").unwrap_or_else(|_| "manga-cli".to_string());
+    let web_dist_path = std::env::var("MANGA_WEB_DIST_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/usr/local/share/wnacg-web"));
-    let task_db_path = std::env::var("WNACG_TASK_STORE_PATH")
+        .unwrap_or_else(|_| PathBuf::from("/usr/local/share/manga-web"));
+    let task_db_path = std::env::var("MANGA_TASK_STORE_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/data/wnacg-tasks.sqlite"));
-    let tasks = Arc::new(RwLock::new(
-        load_tasks(&task_db_path).await.unwrap_or_default(),
-    ));
+        .unwrap_or_else(|_| PathBuf::from("/data/manga-tasks.sqlite"));
+    let tasks = Arc::new(RwLock::new(load_tasks(&task_db_path).await?));
 
     let api_router = Router::new()
         .route("/health", get(health))
@@ -232,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(app_state);
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
-    println!("wnacg-api listening on http://{addr}");
+    println!("manga-api listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -348,7 +350,7 @@ async fn run_download_task(state: AppState, task_id: String, query: DownloadQuer
     let mut command = Command::new(&state.cli_path);
     command
         .args(&args)
-        .env("WNACG_CLI_DISABLE_TASK_PROXY", "1")
+        .env("MANGA_CLI_DISABLE_TASK_PROXY", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -499,8 +501,7 @@ fn load_tasks_blocking(path: &PathBuf) -> anyhow::Result<HashMap<String, Downloa
     let conn = open_task_db(path)?;
     let mut tasks = load_tasks_from_db(&conn)?;
     if tasks.is_empty() {
-        let legacy_json_path = path.with_extension("json");
-        if legacy_json_path.exists() {
+        if let Some(legacy_json_path) = first_existing_legacy_json_path(path) {
             let imported = load_legacy_json_tasks(&legacy_json_path)?;
             if !imported.is_empty() {
                 persist_task_batch(&conn, imported.values())?;
@@ -536,11 +537,33 @@ fn load_tasks_from_db(conn: &Connection) -> anyhow::Result<HashMap<String, Downl
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut tasks = HashMap::new();
     for row in rows {
-        let payload = row?;
-        let task: DownloadTask = serde_json::from_str(&payload)?;
+        let payload = match row {
+            Ok(payload) => payload,
+            Err(err) => {
+                eprintln!("failed to read task row from sqlite: {err:#}");
+                continue;
+            }
+        };
+        let task: DownloadTask = match serde_json::from_str(&payload) {
+            Ok(task) => task,
+            Err(err) => {
+                eprintln!("failed to parse task payload from sqlite: {err:#}");
+                continue;
+            }
+        };
         tasks.insert(task.id.clone(), task);
     }
     Ok(tasks)
+}
+
+fn first_existing_legacy_json_path(path: &PathBuf) -> Option<PathBuf> {
+    let candidates = [
+        path.with_extension("json"),
+        PathBuf::from("/var/lib/manga-downloader/manga-tasks.json"),
+        PathBuf::from("/data/manga-tasks.json"),
+        PathBuf::from("/data/wnacg-tasks.json"),
+    ];
+    candidates.into_iter().find(|candidate| candidate.exists())
 }
 
 fn persist_task_batch<'a, I>(conn: &Connection, tasks: I) -> anyhow::Result<()>
@@ -640,4 +663,21 @@ fn now_string() -> String {
         .unwrap_or_default()
         .as_secs();
     now.to_string()
+}
+
+fn infer_provider(target: &str) -> &'static str {
+    let lower = target.to_ascii_lowercase();
+    if lower.starts_with("jm:")
+        || lower.contains("jmcomic")
+        || lower.contains("jm-comic")
+        || lower.contains("18comic")
+        || lower.contains("jmapiproxy")
+        || lower.contains("cdnzack")
+        || lower.contains("cdnhth")
+        || lower.contains("cdnbea")
+    {
+        "jmcomic"
+    } else {
+        "wnacg"
+    }
 }

@@ -1,12 +1,12 @@
 [package]
-name = "wnacg-downloader"
+name = "manga-downloader"
 version = "0.1.0"
-description = "WNACG downloader HTTP service"
+description = "Manga downloader HTTP service"
 authors = ["wmgylc"]
 edition = "2021"
 
 [lib]
-name = "wnacg_downloader_lib"
+name = "manga_downloader_lib"
 crate-type = ["rlib"]
 
 [dependencies]
@@ -19,6 +19,9 @@ tower-http = { version = "0.6.2", features = ["cors", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 yaserde = { version = "0.12.0", features = ["yaserde_derive"] }
+base64 = "0.22.1"
+aes = "0.8.4"
+md-5 = "0.10.6"
 
 specta = { version = "2.0.0-rc", features = ["derive", "serde_json"] }
 

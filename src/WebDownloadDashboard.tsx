@@ -14,6 +14,7 @@ import {
 type DownloadTask = {
   id: string
   target: string
+  provider?: 'wnacg' | 'jmcomic'
   status: 'downloading' | 'success' | 'failed'
   title?: string
   cover?: string
@@ -113,6 +114,25 @@ export default defineComponent({
       return Math.min(100, Math.round((task.completedPages / task.totalPages) * 100))
     }
 
+    function providerMeta(task: DownloadTask) {
+      const lower = task.target.toLowerCase()
+      const provider =
+        task.provider ??
+        (lower.startsWith('jm:') ||
+        lower.includes('jmcomic') ||
+        lower.includes('jm-comic') ||
+        lower.includes('18comic') ||
+        lower.includes('jmapiproxy') ||
+        lower.includes('cdnzack') ||
+        lower.includes('cdnhth') ||
+        lower.includes('cdnbea')
+          ? 'jmcomic'
+          : 'wnacg')
+      return provider === 'jmcomic'
+        ? { label: 'JMComic', type: 'info' as const }
+        : { label: 'WNACG', type: 'default' as const }
+    }
+
     onMounted(async () => {
       await loadTasks()
       timer = window.setInterval(loadTasks, 2000)
@@ -128,16 +148,6 @@ export default defineComponent({
       <div class="min-h-screen bg-[radial-gradient(circle_at_top,#fff7ed_0%,#fff 38%,#f8fafc_100%)] text-slate-900">
         <div class="mx-auto max-w-6xl px-4 py-8 md:px-8">
           <div class="mb-8 overflow-hidden rounded-6 border border-solid border-orange-200 bg-white/88 p-6 shadow-[0_24px_80px_rgba(15,23,42,0.08)] backdrop-blur">
-            <div class="mb-2 flex items-center gap-3">
-              <div class="text-sm font-600 uppercase tracking-[0.22em] text-orange-500">WNACG HTTP Downloader</div>
-              <NButton
-                tertiary
-                type="primary"
-                size="small"
-                onClick={() => window.open('/api-doc.html', '_blank', 'noopener,noreferrer')}>
-                API DOC
-              </NButton>
-            </div>
             <div class="mb-6 flex flex-col gap-3 md:flex-row">
               <NInput
                 value={url.value}
@@ -158,7 +168,6 @@ export default defineComponent({
 
           <div class="mb-4 flex items-center justify-between">
             <div class="text-xl font-700">任务列表</div>
-            <div class="text-sm text-slate-500">每 2 秒自动刷新</div>
           </div>
 
           {sortedTasks.value.length === 0 ? (
@@ -196,11 +205,13 @@ export default defineComponent({
                               )}
                             </div>
                             <div class="min-w-0 flex-1">
-                              <NSpace align="center" justify="space-between">
+                              <NSpace align="center">
                                 <NTag type={statusMeta(task.status).tagType} bordered={false}>
                                   {statusMeta(task.status).label}
                                 </NTag>
-                                <div class="text-xs text-slate-400">#{task.id.slice(0, 8)}</div>
+                                <NTag type={providerMeta(task).type} bordered={false}>
+                                  {providerMeta(task).label}
+                                </NTag>
                               </NSpace>
                               <div class="mt-3 line-clamp-3 text-base font-700 leading-snug">
                                 {task.title || task.target}
@@ -225,9 +236,6 @@ export default defineComponent({
                             <div class="mt-4 rounded-4 bg-rose-50 px-3 py-2 text-sm text-rose-700">{task.error}</div>
                           )}
 
-                          {task.zipPath && (
-                            <div class="mt-4 rounded-4 bg-slate-50 px-3 py-2 text-xs text-slate-500 break-all">{task.zipPath}</div>
-                          )}
                         </NCard>
                       ))}
                     </div>

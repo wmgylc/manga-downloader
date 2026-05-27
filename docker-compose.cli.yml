@@ -1,19 +1,21 @@
 services:
-  wnacg-cli:
+  manga-downloader:
+    image: manga-downloader:latest
     build:
       context: .
       dockerfile: Dockerfile.cli
-    container_name: wnacg-cli
+    container_name: manga-downloader
     working_dir: /workspace
     restart: always
     environment:
-      WNACG_TASK_API_BASE: "http://127.0.0.1:3000"
-      WNACG_WEB_DIST_PATH: "/usr/local/share/wnacg-web"
-      WNACG_CLI_PATH: "/usr/local/libexec/wnacg-worker"
-      WNACG_TASK_STORE_PATH: "/var/lib/wnacg/wnacg-tasks.sqlite"
+      MANGA_TASK_API_BASE: "http://127.0.0.1:3000"
+      MANGA_WEB_DIST_PATH: "/usr/local/share/manga-web"
+      MANGA_CLI_PATH: "/usr/local/libexec/manga-worker"
+      MANGA_TASK_STORE_PATH: "/var/lib/manga-downloader/manga-tasks.sqlite"
     volumes:
       - /vol4/1000/media/porn/manga:/data
       - ./docker-config:/config
+      - ./data/tasks:/var/lib/manga-downloader
     ports:
       - "3001:3000"
-    command: ["wnacg-api"]
+    command: ["manga-api"]
