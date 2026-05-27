@@ -1,6 +1,6 @@
 # WNACG Downloader Service
 
-一个用于 WNACG 下载的网页与 HTTP 服务。
+一个用于 WNACG 与 JMComic 下载的网页与 HTTP 服务。
 
 ## 当前形态
 
@@ -33,6 +33,7 @@ http://127.0.0.1:3001/api/health
 ```text
 .
 ├── Dockerfile.cli
+├── THIRD_PARTY_NOTICES.md
 ├── docker-compose.cli.yml
 ├── docker-config/
 ├── public/
@@ -50,10 +51,12 @@ http://127.0.0.1:3001/api/health
         ├── bin/wnacg-cli.rs
         ├── cli.rs
         ├── config.rs
+        ├── errors.rs
+        ├── extensions.rs
+        ├── jmcomic.rs
         ├── lib.rs
         ├── types/
-        ├── utils.rs
-        └── wnacg_client.rs
+        └── utils.rs
 ```
 
 ## Docker 运行
@@ -114,10 +117,11 @@ docker compose -f docker-compose.cli.yml up -d --build
 - 分页详情页
 - 漫画任意一页
 - 纯数字漫画 ID
+- JMComic / 18comic 漫画或章节 URL
 
 更完整的接口说明见：
 
-[`public/api-doc.md`](/Users/wmgylc/code/wnacg-downloader/public/api-doc.md)
+[`public/api-doc.md`](public/api-doc.md)
 
 ## 下载行为
 

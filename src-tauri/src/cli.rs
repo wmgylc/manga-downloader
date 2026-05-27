@@ -21,6 +21,7 @@ use zip::write::SimpleFileOptions;
 
 use crate::{
     config::DEFAULT_API_DOMAIN,
+    jmcomic,
     types::{Comic, DownloadFormat, ImgList, SearchResult},
     utils::filename_filter,
 };
@@ -235,6 +236,10 @@ async fn run_search(args: SearchArgs) -> anyhow::Result<()> {
 }
 
 async fn run_comic(args: ComicArgs) -> anyhow::Result<()> {
+    if jmcomic::looks_like_jm_target(&args.target) {
+        return run_jm_comic(args).await;
+    }
+
     let cli_config = load_cli_config(args.common.config.as_deref())?;
     let download_dir = resolve_download_dir(args.common.download_dir, &cli_config);
     let client = CliClient::new(&args.common.api_domain, args.common.proxy.as_deref())?;
@@ -261,10 +266,36 @@ async fn run_comic(args: ComicArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_jm_comic(args: ComicArgs) -> anyhow::Result<()> {
+    let api_domain = jm_api_domain(&args.common.api_domain);
+    let client = jmcomic::JmClient::new(&api_domain, args.common.proxy.as_deref())?;
+    let comic = client
+        .fetch_summary(&args.target)
+        .await
+        .with_context(|| format!("获取 JMComic `{}` 详情失败", args.target))?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&comic).context("序列化 JMComic 详情失败")?
+        );
+        return Ok(());
+    }
+
+    println!("[JM{}] {}", comic.id, comic.title);
+    println!("cover: {}", comic.cover);
+    println!("pages: {}", comic.image_count);
+    Ok(())
+}
+
 async fn run_download(args: DownloadArgs) -> anyhow::Result<()> {
     if let Some(response) = maybe_submit_download_task(&args).await? {
         println!("{response}");
         return Ok(());
+    }
+
+    if jmcomic::looks_like_jm_target(&args.target) {
+        return run_jm_download(args).await;
     }
 
     let cli_config = load_cli_config(args.common.config.as_deref())?;
@@ -433,6 +464,96 @@ async fn run_download(args: DownloadArgs) -> anyhow::Result<()> {
 
     println!("downloaded to {}", zip_path.display());
     Ok(())
+}
+
+async fn run_jm_download(args: DownloadArgs) -> anyhow::Result<()> {
+    let cli_config = load_cli_config(args.common.config.as_deref())?;
+    let download_dir = resolve_download_dir(args.common.download_dir.clone(), &cli_config);
+    std::fs::create_dir_all(&download_dir)
+        .with_context(|| format!("创建下载目录 `{}` 失败", download_dir.display()))?;
+
+    let notify_client = CliClient::new(&args.common.api_domain, args.common.proxy.as_deref())?;
+    let api_domain = jm_api_domain(&args.common.api_domain);
+    let jm_client = jmcomic::JmClient::new(&api_domain, args.common.proxy.as_deref())?;
+    let options = jmcomic::JmDownloadOptions {
+        download_dir,
+        format: args.format.into(),
+        img_concurrency: cli_config
+            .default_img_concurrency
+            .unwrap_or(args.img_concurrency)
+            .max(1),
+        img_interval_sec: cli_config
+            .default_img_interval_sec
+            .unwrap_or(args.img_interval_sec),
+        img_retry_count: cli_config.default_img_retry_count.unwrap_or(2),
+    };
+    let task_retry_count = cli_config.default_task_retry_count.unwrap_or(1);
+
+    let mut retry_index = 0usize;
+    loop {
+        match jm_client.download_target(&args.target, &options).await {
+            Ok(success) => {
+                notify_download_result(
+                    &notify_client,
+                    &cli_config,
+                    WebhookPayload {
+                        event: "download_finished",
+                        status: "success",
+                        comic_id: Some(success.comic_id),
+                        title: success.title,
+                        download_dir: None,
+                        zip_path: Some(success.zip_path.display().to_string()),
+                        image_count: Some(success.total_images as i64),
+                        completed_images: success.completed_images,
+                        total_images: success.total_images,
+                        reason: None,
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(failure) => {
+                if retry_index < task_retry_count {
+                    retry_index += 1;
+                    println!(
+                        "jmcomic download attempt failed, retrying ({}/{}): {}",
+                        retry_index + 1,
+                        task_retry_count + 1,
+                        failure.reason
+                    );
+                    sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+
+                let resume_dir = failure
+                    .download_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string());
+                let reason = match &resume_dir {
+                    Some(path) => format!("{}。临时目录已保留，可续传：{path}", failure.reason),
+                    None => failure.reason.clone(),
+                };
+                notify_download_result(
+                    &notify_client,
+                    &cli_config,
+                    WebhookPayload {
+                        event: "download_finished",
+                        status: "failed",
+                        comic_id: failure.comic_id,
+                        title: failure.title,
+                        download_dir: resume_dir,
+                        zip_path: failure.zip_path.map(|path| path.display().to_string()),
+                        image_count: Some(failure.total_images as i64),
+                        completed_images: failure.completed_images,
+                        total_images: failure.total_images,
+                        reason: Some(reason.clone()),
+                    },
+                )
+                .await?;
+                return Err(anyhow!(reason));
+            }
+        }
+    }
 }
 
 async fn run_tasks(args: TasksArgs) -> anyhow::Result<()> {
@@ -1063,10 +1184,36 @@ fn resolve_download_dir(download_dir: Option<PathBuf>, cli_config: &CliConfig) -
     download_dir
         .or_else(|| cli_config.default_download_dir.clone())
         .unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("downloads")
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("downloads")
         })
+}
+
+fn jm_api_domain(api_domain: &str) -> String {
+    if api_domain == DEFAULT_API_DOMAIN || looks_like_wn_api_domain(api_domain) {
+        jmcomic::default_api_domain().to_string()
+    } else {
+        api_domain.to_string()
+    }
+}
+
+fn looks_like_wn_api_domain(api_domain: &str) -> bool {
+    let trimmed = api_domain.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let normalized_url = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let Ok(url) = Url::parse(&normalized_url) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    host.contains("wnacg") || host.starts_with("wn") || host.contains(".wn")
 }
 
 fn load_cli_config(config_path: Option<&Path>) -> anyhow::Result<CliConfig> {

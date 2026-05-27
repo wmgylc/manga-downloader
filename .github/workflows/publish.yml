@@ -19,7 +19,7 @@ jobs:
       - name: Get version number
         id: get_version
         run: |
-          VERSION=$(jq -r '.version' src-tauri/tauri.conf.json)
+          VERSION=$(awk -F '"' '/^version = / { print $2; exit }' src-tauri/Cargo.toml)
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
   windows-build:

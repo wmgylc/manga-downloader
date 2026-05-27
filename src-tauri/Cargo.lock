@@ -6169,11 +6169,14 @@ dependencies = [
 name = "wnacg-downloader"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "image",
  "lopdf",
+ "md-5",
  "notify",
  "parking_lot 0.12.3",
  "rayon",

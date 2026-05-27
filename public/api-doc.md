@@ -22,6 +22,7 @@ API 前缀：
 - 分页详情页，例如 `https://www.wnacg.com/photos-index-page-1-aid-328415.html`
 - 漫画任意一页，例如 `https://www.wnacg.com/photos-view-id-27566986.html`
 - 纯数字漫画 ID，例如 `328415`
+- JMComic / 18comic 漫画或章节 URL，例如 `https://18comic.vip/album/123456`
 
 ## 接口总览
 

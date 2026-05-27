@@ -2,6 +2,7 @@ pub mod cli;
 mod config;
 mod errors;
 mod extensions;
+mod jmcomic;
 mod types;
 mod utils;
 
