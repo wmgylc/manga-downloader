@@ -17,6 +17,15 @@ notify() {
 {
   echo "== $(date '+%Y-%m-%d %H:%M:%S') deploying manga-downloader =="
   cd "$PROJECT_DIR"
+  mkdir -p data/tasks data/backups
+  if [[ -f data/tasks/manga-tasks.sqlite ]]; then
+    backup_path="data/backups/manga-tasks.$(date '+%Y%m%d-%H%M%S').sqlite"
+    cp -p data/tasks/manga-tasks.sqlite "$backup_path"
+    echo "backed up task database to $backup_path"
+  elif [[ -f data/wnacg/wnacg-tasks.sqlite ]]; then
+    cp -p data/wnacg/wnacg-tasks.sqlite data/tasks/manga-tasks.sqlite
+    echo "migrated legacy task database from data/wnacg/wnacg-tasks.sqlite"
+  fi
   export DOCKER_BUILDKIT=1
   export COMPOSE_DOCKER_CLI_BUILD=1
   docker compose -f docker-compose.cli.yml build

@@ -205,9 +205,7 @@ async fn main() -> anyhow::Result<()> {
     let task_db_path = std::env::var("MANGA_TASK_STORE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/data/manga-tasks.sqlite"));
-    let tasks = Arc::new(RwLock::new(
-        load_tasks(&task_db_path).await.unwrap_or_default(),
-    ));
+    let tasks = Arc::new(RwLock::new(load_tasks(&task_db_path).await?));
 
     let api_router = Router::new()
         .route("/health", get(health))
@@ -503,8 +501,7 @@ fn load_tasks_blocking(path: &PathBuf) -> anyhow::Result<HashMap<String, Downloa
     let conn = open_task_db(path)?;
     let mut tasks = load_tasks_from_db(&conn)?;
     if tasks.is_empty() {
-        let legacy_json_path = path.with_extension("json");
-        if legacy_json_path.exists() {
+        if let Some(legacy_json_path) = first_existing_legacy_json_path(path) {
             let imported = load_legacy_json_tasks(&legacy_json_path)?;
             if !imported.is_empty() {
                 persist_task_batch(&conn, imported.values())?;
@@ -540,11 +537,33 @@ fn load_tasks_from_db(conn: &Connection) -> anyhow::Result<HashMap<String, Downl
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut tasks = HashMap::new();
     for row in rows {
-        let payload = row?;
-        let task: DownloadTask = serde_json::from_str(&payload)?;
+        let payload = match row {
+            Ok(payload) => payload,
+            Err(err) => {
+                eprintln!("failed to read task row from sqlite: {err:#}");
+                continue;
+            }
+        };
+        let task: DownloadTask = match serde_json::from_str(&payload) {
+            Ok(task) => task,
+            Err(err) => {
+                eprintln!("failed to parse task payload from sqlite: {err:#}");
+                continue;
+            }
+        };
         tasks.insert(task.id.clone(), task);
     }
     Ok(tasks)
+}
+
+fn first_existing_legacy_json_path(path: &PathBuf) -> Option<PathBuf> {
+    let candidates = [
+        path.with_extension("json"),
+        PathBuf::from("/var/lib/manga-downloader/manga-tasks.json"),
+        PathBuf::from("/data/manga-tasks.json"),
+        PathBuf::from("/data/wnacg-tasks.json"),
+    ];
+    candidates.into_iter().find(|candidate| candidate.exists())
 }
 
 fn persist_task_batch<'a, I>(conn: &Connection, tasks: I) -> anyhow::Result<()>
