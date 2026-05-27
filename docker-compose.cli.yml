@@ -1,9 +1,10 @@
 services:
-  manga-cli:
+  manga-downloader:
+    image: manga-downloader:latest
     build:
       context: .
       dockerfile: Dockerfile.cli
-    container_name: manga-cli
+    container_name: manga-downloader
     working_dir: /workspace
     restart: always
     environment:
