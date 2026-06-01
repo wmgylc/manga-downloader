@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
-    sync::RwLock,
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
 };
 use tower_http::{
     cors::CorsLayer,
@@ -26,6 +26,43 @@ struct AppState {
     cli_path: String,
     tasks: Arc<RwLock<HashMap<String, DownloadTask>>>,
     task_db_path: Arc<PathBuf>,
+    provider_limits: Arc<ProviderLimits>,
+}
+
+struct ProviderLimits {
+    wnacg: Arc<Semaphore>,
+    jmcomic: Arc<Semaphore>,
+    img_concurrency: usize,
+}
+
+impl ProviderLimits {
+    fn new(img_concurrency: usize) -> Self {
+        Self {
+            wnacg: Arc::new(Semaphore::new(1)),
+            jmcomic: Arc::new(Semaphore::new(1)),
+            img_concurrency: img_concurrency.max(1),
+        }
+    }
+
+    async fn acquire(&self, provider: &str) -> anyhow::Result<OwnedSemaphorePermit> {
+        let semaphore = match provider {
+            "jmcomic" => self.jmcomic.clone(),
+            _ => self.wnacg.clone(),
+        };
+        semaphore
+            .acquire_owned()
+            .await
+            .map_err(|err| anyhow::anyhow!("获取 `{provider}` 下载槽位失败: {err}"))
+    }
+
+    fn cap_query(&self, query: &mut DownloadQuery) {
+        query.img_concurrency = Some(
+            query
+                .img_concurrency
+                .unwrap_or(self.img_concurrency)
+                .clamp(1, self.img_concurrency),
+        );
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -206,6 +243,10 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/data/manga-tasks.sqlite"));
     let tasks = Arc::new(RwLock::new(load_tasks(&task_db_path).await?));
+    let provider_img_concurrency = std::env::var("MANGA_PROVIDER_IMG_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5);
 
     let api_router = Router::new()
         .route("/health", get(health))
@@ -225,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
         cli_path,
         tasks,
         task_db_path: Arc::new(task_db_path),
+        provider_limits: Arc::new(ProviderLimits::new(provider_img_concurrency)),
     };
     let app = Router::new()
         .nest("/api", api_router.clone())
@@ -345,7 +387,40 @@ async fn get_task(State(state): State<AppState>, Path(id): Path<String>) -> impl
     }
 }
 
-async fn run_download_task(state: AppState, task_id: String, query: DownloadQuery) {
+async fn run_download_task(state: AppState, task_id: String, mut query: DownloadQuery) {
+    let provider = infer_provider(&query.target);
+    update_task(&state, &task_id, |task| {
+        task.stdout.push(format!("waiting for {provider} download slot"));
+        task.updated_at = now_string();
+    })
+    .await;
+
+    let _provider_permit = match state.provider_limits.acquire(provider).await {
+        Ok(permit) => permit,
+        Err(err) => {
+            update_task(&state, &task_id, |task| {
+                task.status = "failed".to_string();
+                task.error = Some(err.to_string());
+                task.finished_at = Some(now_string());
+                task.updated_at = now_string();
+            })
+            .await;
+            return;
+        }
+    };
+    state.provider_limits.cap_query(&mut query);
+    let capped_img_concurrency = query
+        .img_concurrency
+        .unwrap_or(state.provider_limits.img_concurrency);
+    update_task(&state, &task_id, |task| {
+        task.stdout.push(format!(
+            "started {provider} download with shared image concurrency {}",
+            capped_img_concurrency
+        ));
+        task.updated_at = now_string();
+    })
+    .await;
+
     let args = query.download_args();
     let mut command = Command::new(&state.cli_path);
     command

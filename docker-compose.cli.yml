@@ -12,6 +12,7 @@ services:
       MANGA_WEB_DIST_PATH: "/usr/local/share/manga-web"
       MANGA_CLI_PATH: "/usr/local/libexec/manga-worker"
       MANGA_TASK_STORE_PATH: "/var/lib/manga-downloader/manga-tasks.sqlite"
+      MANGA_PROVIDER_IMG_CONCURRENCY: "5"
     volumes:
       - /vol4/1000/media/porn/manga:/data
       - ./docker-config:/config
