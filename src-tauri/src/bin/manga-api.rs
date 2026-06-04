@@ -1,8 +1,9 @@
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, process::Stdio, sync::Arc};
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, get_service},
     Json, Router,
@@ -253,8 +254,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/search/keyword", get(search_keyword))
         .route("/search/tag", get(search_tag))
         .route("/comic", get(get_comic))
-        .route("/download", get(start_download))
-        .route("/download/start", get(start_download))
+        .route("/download", get(start_download).post(start_download_post))
+        .route(
+            "/download/start",
+            get(start_download).post(start_download_post),
+        )
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task));
     let static_index = web_dist_path.join("index.html");
@@ -291,6 +295,8 @@ async fn health() -> impl IntoResponse {
             "GET /comic?target=<id-or-url>",
             "GET /download?target=<id-or-url>",
             "GET /download/start?target=<id-or-url>",
+            "POST /download {\"target\":\"<id-or-url>\"}",
+            "POST /download/start {\"target\":\"<id-or-url>\"}",
             "GET /tasks",
             "GET /tasks/<id>"
         ]
@@ -349,6 +355,25 @@ async fn start_download(
     State(state): State<AppState>,
     Query(query): Query<DownloadQuery>,
 ) -> impl IntoResponse {
+    create_download_task(state, query).await
+}
+
+async fn start_download_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    match parse_download_post_body(&headers, &body) {
+        Ok(query) => create_download_task(state, query).await,
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn create_download_task(state: AppState, query: DownloadQuery) -> axum::response::Response {
     let task_id = Uuid::new_v4().to_string();
     let now = now_string();
 
@@ -368,6 +393,34 @@ async fn start_download(
     });
 
     (StatusCode::OK, Json(task)).into_response()
+}
+
+fn parse_download_post_body(headers: &HeaderMap, body: &[u8]) -> anyhow::Result<DownloadQuery> {
+    if body.is_empty() {
+        anyhow::bail!("POST body cannot be empty");
+    }
+
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    match content_type.as_str() {
+        "application/x-www-form-urlencoded" => serde_urlencoded::from_bytes(body).map_err(Into::into),
+        "application/json" => serde_json::from_slice(body).map_err(Into::into),
+        "" => serde_json::from_slice(body)
+            .map_err(anyhow::Error::from)
+            .or_else(|_| serde_urlencoded::from_bytes(body).map_err(anyhow::Error::from)),
+        _ => Err(anyhow::anyhow!(
+            "unsupported content type `{}`; use application/json or application/x-www-form-urlencoded",
+            content_type
+        )),
+    }
 }
 
 async fn list_tasks(State(state): State<AppState>) -> impl IntoResponse {

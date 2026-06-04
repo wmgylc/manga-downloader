@@ -6186,6 +6186,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "specta",
  "specta-typescript",
  "strfmt",
