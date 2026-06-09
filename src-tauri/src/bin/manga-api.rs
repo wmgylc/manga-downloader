@@ -197,6 +197,14 @@ struct DownloadTask {
     finished_at: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadTaskResponse {
+    #[serde(flatten)]
+    task: DownloadTask,
+    message: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ComicInfo {
@@ -365,11 +373,7 @@ async fn start_download_post(
 ) -> impl IntoResponse {
     match parse_download_post_body(&headers, &body) {
         Ok(query) => create_download_task(state, query).await,
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "error": err.to_string() })),
-        )
-            .into_response(),
+        Err(err) => error_message_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
 
@@ -392,7 +396,28 @@ async fn create_download_task(state: AppState, query: DownloadQuery) -> axum::re
         run_download_task(state_for_task, task_id, query).await;
     });
 
-    (StatusCode::OK, Json(task)).into_response()
+    let message = format!("开始下载：{}", task_title_for_message(&task));
+    (
+        StatusCode::OK,
+        Json(DownloadTaskResponse { task, message }),
+    )
+        .into_response()
+}
+
+fn task_title_for_message(task: &DownloadTask) -> &str {
+    task.title.as_deref().unwrap_or(task.target.as_str())
+}
+
+fn error_message_response(status: StatusCode, error: String) -> axum::response::Response {
+    (
+        status,
+        Json(json!({
+            "ok": false,
+            "error": error.clone(),
+            "message": error
+        })),
+    )
+        .into_response()
 }
 
 fn parse_download_post_body(headers: &HeaderMap, body: &[u8]) -> anyhow::Result<DownloadQuery> {
