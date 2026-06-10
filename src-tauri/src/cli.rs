@@ -1457,31 +1457,36 @@ async fn notify_bark(client: &CliClient, bark_url: &str, payload: &WebhookPayloa
 }
 
 fn bark_message_from_payload(payload: &WebhookPayload) -> (String, String) {
-    let title = match payload.status {
-        "success" => format!(
-            "下载完成 #{}",
-            payload
-                .comic_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "-".to_string())
-        ),
-        _ => format!(
-            "下载失败 #{}",
-            payload
-                .comic_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "-".to_string())
-        ),
-    };
+    let title = "manga-downloader".to_string();
     let body = match payload.status {
-        "success" => payload.title.clone(),
-        _ => format!(
-            "{} | {} | {}/{}",
-            payload.reason.as_deref().unwrap_or("未知错误"),
-            payload.title,
-            payload.completed_images,
-            payload.total_images
-        ),
+        "success" => build_download_success_message(payload),
+        _ => build_download_failure_message(payload),
     };
     (title, body)
+}
+
+fn build_download_success_message(payload: &WebhookPayload) -> String {
+    let mut message = format!(
+        "漫画「{}」已下载完成，共 {} / {} 页。",
+        payload.title, payload.completed_images, payload.total_images
+    );
+    if let Some(zip_path) = payload.zip_path.as_deref().filter(|path| !path.is_empty()) {
+        message.push_str(&format!(" 文件已保存到 {zip_path}。"));
+    }
+    if let Some(comic_id) = payload.comic_id {
+        message.push_str(&format!("\n流水号:{comic_id}"));
+    }
+    message
+}
+
+fn build_download_failure_message(payload: &WebhookPayload) -> String {
+    let reason = payload.reason.as_deref().unwrap_or("未知错误");
+    let mut message = format!(
+        "漫画「{}」下载失败，已完成 {} / {} 页。{}",
+        payload.title, payload.completed_images, payload.total_images, reason
+    );
+    if let Some(comic_id) = payload.comic_id {
+        message.push_str(&format!("\n流水号:{comic_id}"));
+    }
+    message
 }

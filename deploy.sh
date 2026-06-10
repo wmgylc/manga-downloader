@@ -34,4 +34,4 @@ notify() {
   echo "== $(date '+%Y-%m-%d %H:%M:%S') deployment complete =="
 } >>"$LOG_FILE" 2>&1
 
-notify "manga-downloader deploy complete" "codex/add-jmcomic-support deployed on 10.10.10.206"
+notify "manga-downloader" "服务已部署到 10.10.10.206，容器已完成重建并启动。"
