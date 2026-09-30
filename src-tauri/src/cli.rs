@@ -26,6 +26,10 @@ use crate::{
     utils::filename_filter,
 };
 
+const API_TIMEOUT_SECS: u64 = 30;
+const IMAGE_TIMEOUT_SECS: u64 = 60;
+const CLIENT_RETRY_WINDOW_SECS: u64 = 15;
+
 #[derive(Parser, Debug)]
 #[command(name = "manga-cli", about = "Search and download manga from the terminal")]
 struct Cli {
@@ -345,8 +349,8 @@ async fn run_download(args: DownloadArgs) -> anyhow::Result<()> {
         img_interval_sec: cli_config
             .default_img_interval_sec
             .unwrap_or(args.img_interval_sec),
-        img_retry_count: cli_config.default_img_retry_count.unwrap_or(2),
-        task_retry_count: cli_config.default_task_retry_count.unwrap_or(1),
+        img_retry_count: cli_config.default_img_retry_count.unwrap_or(4),
+        task_retry_count: cli_config.default_task_retry_count.unwrap_or(3),
         use_original_filename: args.use_original_filename,
     };
 
@@ -485,9 +489,9 @@ async fn run_jm_download(args: DownloadArgs) -> anyhow::Result<()> {
         img_interval_sec: cli_config
             .default_img_interval_sec
             .unwrap_or(args.img_interval_sec),
-        img_retry_count: cli_config.default_img_retry_count.unwrap_or(2),
+        img_retry_count: cli_config.default_img_retry_count.unwrap_or(4),
     };
-    let task_retry_count = cli_config.default_task_retry_count.unwrap_or(1);
+    let task_retry_count = cli_config.default_task_retry_count.unwrap_or(3);
 
     let mut retry_index = 0usize;
     loop {
@@ -713,9 +717,9 @@ fn print_task_summary(task: serde_json::Value, explicit_id: Option<&str>) -> any
 
 impl CliClient {
     fn new(api_domain: &str, proxy: Option<&str>) -> anyhow::Result<Self> {
-        let api_client = create_client(proxy, Duration::from_secs(3))?;
-        let img_client = create_client(proxy, Duration::from_secs(15))?;
-        let cover_client = create_plain_client(proxy, Duration::from_secs(15))?;
+        let api_client = create_client(proxy, Duration::from_secs(API_TIMEOUT_SECS))?;
+        let img_client = create_client(proxy, Duration::from_secs(IMAGE_TIMEOUT_SECS))?;
+        let cover_client = create_plain_client(proxy, Duration::from_secs(API_TIMEOUT_SECS))?;
         Ok(Self {
             api_domain: api_domain.to_string(),
             api_client,
@@ -1222,14 +1226,27 @@ fn load_cli_config(config_path: Option<&Path>) -> anyhow::Result<CliConfig> {
         .or_else(|| std::env::var_os("MANGA_CLI_CONFIG").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("/config/manga-cli.json"));
 
-    if !path.exists() {
-        return Ok(CliConfig::default());
+    let mut config = if path.exists() {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("读取配置文件 `{}` 失败", path.display()))?;
+        serde_json::from_str::<CliConfig>(&content)
+            .with_context(|| format!("解析配置文件 `{}` 失败", path.display()))?
+    } else {
+        CliConfig::default()
+    };
+
+    if let Ok(value) = std::env::var("MANGA_DEFAULT_IMG_RETRY_COUNT") {
+        config.default_img_retry_count = Some(value.parse().with_context(|| {
+            "环境变量 `MANGA_DEFAULT_IMG_RETRY_COUNT` 必须是非负整数"
+        })?);
+    }
+    if let Ok(value) = std::env::var("MANGA_DEFAULT_TASK_RETRY_COUNT") {
+        config.default_task_retry_count = Some(value.parse().with_context(|| {
+            "环境变量 `MANGA_DEFAULT_TASK_RETRY_COUNT` 必须是非负整数"
+        })?);
     }
 
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("读取配置文件 `{}` 失败", path.display()))?;
-    serde_json::from_str::<CliConfig>(&content)
-        .with_context(|| format!("解析配置文件 `{}` 失败", path.display()))
+    Ok(config)
 }
 
 fn extract_comic_id(input: &str) -> anyhow::Result<i64> {
@@ -1276,7 +1293,7 @@ fn create_client(proxy: Option<&str>, timeout: Duration) -> anyhow::Result<Clien
     let retry_policy = ExponentialBackoff::builder()
         .base(1)
         .jitter(Jitter::Bounded)
-        .build_with_total_retry_duration(Duration::from_secs(5));
+        .build_with_total_retry_duration(Duration::from_secs(CLIENT_RETRY_WINDOW_SECS));
 
     let client = create_plain_client(proxy, timeout)?;
     Ok(reqwest_middleware::ClientBuilder::new(client)

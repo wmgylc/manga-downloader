@@ -100,8 +100,8 @@ docker-config/manga-cli.json
   "default_download_dir": "/data",
   "default_img_concurrency": 5,
   "default_img_interval_sec": 1,
-  "default_img_retry_count": 2,
-  "default_task_retry_count": 1
+  "default_img_retry_count": 4,
+  "default_task_retry_count": 3
 }
 ```
 

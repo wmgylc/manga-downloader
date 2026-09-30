@@ -233,12 +233,15 @@ pub fn looks_like_jm_target(input: &str) -> bool {
     parse_jm_target(input).is_some()
 }
 
+const API_TIMEOUT_SECS: u64 = 30;
+const IMAGE_TIMEOUT_SECS: u64 = 60;
+
 impl JmClient {
     pub fn new(api_domain: &str, proxy: Option<&str>) -> anyhow::Result<Self> {
         Ok(Self {
             api_domain: api_domain.to_string(),
-            api_client: create_plain_client(proxy, Duration::from_secs(8))?,
-            img_client: create_plain_client(proxy, Duration::from_secs(20))?,
+            api_client: create_plain_client(proxy, Duration::from_secs(API_TIMEOUT_SECS))?,
+            img_client: create_plain_client(proxy, Duration::from_secs(IMAGE_TIMEOUT_SECS))?,
         })
     }
 
