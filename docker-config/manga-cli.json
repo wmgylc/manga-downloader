@@ -1,6 +1,5 @@
 {
   "webhook_url": "",
-  "bark_url": "https://bark.wmgylc.top:10000/CzS6dEcWSikbSJomnfYgZT",
   "default_download_dir": "/data",
   "default_img_concurrency": 5,
   "default_img_interval_sec": 1,

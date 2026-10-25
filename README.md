@@ -4,14 +4,14 @@ Manga Downloader 是一个面向 Docker 部署的漫画下载服务，提供网�
 
 ## 功能特性
 
-- 网页端提交下载任务，查看下载中、下载完成、下载失败任务。
-- HTTP API 支持搜索、解析漫画信息、创建下载任务、查询任务状态。
+- 网页端提交、查看和取消下载任务。
+- HTTP API 支持搜索、解析漫画信息、异步创建任务、查询进度和取消任务。
 - 支持 WNACG 漫画 ID、详情页、分页页、任意阅读页。
 - 支持 JMComic/18comic 的 album、photo、chapter、CDN 图片链接与 `jm:<id>` 输入。
 - 下载任务异步执行，前端自动刷新任务进度。
 - 任务历史使用 SQLite 持久化，容器重建后继续保留。
 - 部署脚本会在重建前自动备份任务数据库。
-- 支持 Bark/Webhook 下载完成通知。
+- 支持 Webhook 下载结果通知。
 
 ## 快速开始
 
@@ -96,7 +96,6 @@ docker-config/manga-cli.json
 ```json
 {
   "webhook_url": "",
-  "bark_url": "",
   "default_download_dir": "/data",
   "default_img_concurrency": 5,
   "default_img_interval_sec": 1,
@@ -134,21 +133,31 @@ JMComic / 18comic：
 | `GET /api/search/keyword?q=<关键词>&page=1` | WNACG 关键词搜索 |
 | `GET /api/search/tag?tag=<标签>&page=1` | WNACG 标签搜索 |
 | `GET /api/comic?target=<URL或ID>` | 解析漫画标题、封面、页数 |
-| `GET /api/download/start?target=<URL或ID>` | 创建下载任务 |
+| `POST /api/download` | 解析信息并异步创建任务 |
+| `GET /api/task/<id>` | 查询状态、页数进度和 message |
+| `POST /api/task/<id>/cancel` | 取消排队中或正在下载的任务 |
+| `GET /api/download/start?target=<URL或ID>` | 兼容旧调用，创建任务 |
 | `GET /api/tasks` | 查询任务列表 |
-| `GET /api/tasks/<id>` | 查询单个任务 |
 
-创建下载任务：
-
-```bash
-curl "http://127.0.0.1:3001/api/download/start?target=https://18comic.vip/photo/1435054"
-```
-
-查询任务：
+创建下载任务（请求可用 `url`、`target` 或 `id` 字段）：
 
 ```bash
-curl "http://127.0.0.1:3001/api/tasks"
+curl -X POST "http://127.0.0.1:3001/api/download" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://18comic.vip/photo/1435054"}'
 ```
+
+POST 会先解析漫画信息，再立即返回 `task_id`、`queued` 状态和 `totalPages`，不等待实际下载。使用下列接口轮询进度：
+
+```bash
+curl "http://127.0.0.1:3001/api/task/<task_id>"
+```
+
+任务状态为 `queued`、`downloading`、`completed`、`failed` 或 `cancelled`；任务响应包含可直接展示的 `message`。下载 Bark 通知已移除，结果通过 API message 返回。
+
+WNACG 合集页（`photos-index-aid-<合集ID>.html` 或 `photos-index-aid-<合集ID>-page-<页码>.html`）也可直接作为 `url` 提交。服务会遍历合集所有分页，并将每个分集分别加入任务列表；返回的 `task_ids` 可用于逐个查询或取消。无分页后缀的普通单本页会自动回退到单本解析。
+
+下载任务按全局 FIFO 队列串行执行。每个实际下载结束后，至少等待 60 秒再启动下一项；单个任务内部的图片并发仍受共享并发上限控制。
 
 更完整的接口说明见 [public/api-doc.md](public/api-doc.md)。
 

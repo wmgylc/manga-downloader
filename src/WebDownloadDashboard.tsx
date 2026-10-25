@@ -14,7 +14,8 @@ type DownloadTask = {
   id: string
   target: string
   provider?: 'wnacg' | 'jmcomic'
-  status: 'downloading' | 'success' | 'failed'
+  status: 'queued' | 'downloading' | 'completed' | 'failed' | 'cancelled' | 'success'
+  cancellationRequested?: boolean
   title?: string
   cover?: string
   totalPages?: number
@@ -26,7 +27,7 @@ type DownloadTask = {
   finishedAt?: string
 }
 
-type TaskGroupKey = 'downloading' | 'success' | 'failed'
+type TaskGroupKey = 'queued' | 'downloading' | 'completed' | 'failed' | 'cancelled'
 
 const API_BASE =
   typeof window !== 'undefined' ? `${window.location.origin}/api` : 'http://10.10.10.206:3000'
@@ -34,11 +35,13 @@ const API_BASE =
 const TASK_GROUPS: Array<{
   key: TaskGroupKey
   label: string
-  tagType: 'warning' | 'success' | 'error'
+  tagType: 'default' | 'warning' | 'success' | 'error'
 }> = [
+  { key: 'queued', label: '排队中', tagType: 'default' },
   { key: 'downloading', label: '下载中', tagType: 'warning' },
-  { key: 'success', label: '下载完成', tagType: 'success' },
+  { key: 'completed', label: '下载完成', tagType: 'success' },
   { key: 'failed', label: '下载失败', tagType: 'error' },
+  { key: 'cancelled', label: '已取消', tagType: 'default' },
 ]
 
 const PROVIDER_MARKERS = [
@@ -61,13 +64,13 @@ export default defineComponent({
     const submitting = ref(false)
     let timer: number | undefined
 
-    async function requestJson(path: string, params?: Record<string, string>) {
+    async function requestJson(path: string, params?: Record<string, string>, init?: RequestInit) {
       const requestUrl = new URL(path.replace(/^\/+/, ''), `${API_BASE.replace(/\/+$/, '')}/`)
       Object.entries(params ?? {}).forEach(([key, value]) => {
         requestUrl.searchParams.set(key, value)
       })
 
-      const response = await fetch(requestUrl)
+      const response = await fetch(requestUrl, init)
       const payload = await response.json()
       if (!response.ok) {
         throw new Error(payload.error || payload.stderr || '请求失败')
@@ -79,9 +82,11 @@ export default defineComponent({
       [...tasks.value].sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt)),
     )
     const groupedTasks = computed<Record<TaskGroupKey, DownloadTask[]>>(() => ({
+      queued: sortedTasks.value.filter((task) => task.status === 'queued'),
       downloading: sortedTasks.value.filter((task) => task.status === 'downloading'),
-      success: sortedTasks.value.filter((task) => task.status === 'success'),
+      completed: sortedTasks.value.filter((task) => task.status === 'completed' || task.status === 'success'),
       failed: sortedTasks.value.filter((task) => task.status === 'failed'),
+      cancelled: sortedTasks.value.filter((task) => task.status === 'cancelled'),
     }))
     const totalPages = computed(() =>
       sortedTasks.value.reduce((total, task) => total + (task.totalPages ?? 0), 0),
@@ -93,7 +98,10 @@ export default defineComponent({
     async function loadTasks() {
       try {
         const payload = await requestJson('tasks')
-        tasks.value = payload.tasks ?? []
+        tasks.value = (payload.tasks ?? []).map((task: DownloadTask) => ({
+          ...task,
+          status: task.status === 'success' ? 'completed' : task.status,
+        }))
       } catch (error) {
         console.error(error)
       }
@@ -108,14 +116,30 @@ export default defineComponent({
 
       submitting.value = true
       try {
-        await requestJson('download/start', { target })
+        const payload = await requestJson('download', undefined, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: target }),
+        })
         url.value = ''
-        message.success('下载任务已创建')
+        message.success(payload.message || '下载任务已加入队列')
         await loadTasks()
       } catch (error) {
         message.error(error instanceof Error ? error.message : '创建下载任务失败')
       } finally {
         submitting.value = false
+      }
+    }
+
+    async function cancelTask(task: DownloadTask) {
+      try {
+        const payload = await requestJson(`task/${encodeURIComponent(task.id)}/cancel`, undefined, {
+          method: 'POST',
+        })
+        message.info(payload.message || '已提交取消请求')
+        await loadTasks()
+      } catch (error) {
+        message.error(error instanceof Error ? error.message : '取消任务失败')
       }
     }
 
@@ -125,7 +149,7 @@ export default defineComponent({
 
     function progressPercentage(task: DownloadTask) {
       if (!task.totalPages || task.totalPages <= 0) {
-        return task.status === 'success' ? 100 : 0
+        return task.status === 'completed' || task.status === 'success' ? 100 : 0
       }
       return Math.min(100, Math.round((task.completedPages / task.totalPages) * 100))
     }
@@ -199,7 +223,7 @@ export default defineComponent({
                 </NButton>
               </div>
             </div>
-            <div class="grid grid-cols-3 divide-x divide-solid divide-[#d8ddd4] md:grid-cols-1 md:divide-x-0 md:divide-y">
+            <div class="grid grid-cols-3 divide-x divide-solid divide-[#d8ddd4] md:grid-cols-5 md:divide-x md:divide-y-0">
               {TASK_GROUPS.map((group) => (
                 <div key={group.key} class="px-4 py-3">
                   <div class="text-xs font-700 uppercase tracking-[0.12em] text-[#69776f]">{group.label}</div>
@@ -266,6 +290,16 @@ export default defineComponent({
                                 <NTag type={providerMeta(task).type} bordered={false} size="small">
                                   {providerMeta(task).label}
                                 </NTag>
+                                {(task.status === 'queued' || task.status === 'downloading') && (
+                                  <NButton
+                                    size="tiny"
+                                    quaternary
+                                    type="error"
+                                    disabled={task.cancellationRequested}
+                                    onClick={() => void cancelTask(task)}>
+                                    {task.cancellationRequested ? '取消中' : '取消'}
+                                  </NButton>
+                                )}
                               </div>
                               <div class="line-clamp-2 text-base font-800 leading-snug text-[#14201c]">
                                 {taskTitle(task)}
@@ -276,7 +310,11 @@ export default defineComponent({
                                   percentage={progressPercentage(task)}
                                   processing={task.status === 'downloading'}
                                   status={
-                                    task.status === 'failed' ? 'error' : task.status === 'success' ? 'success' : 'info'
+                                    task.status === 'failed'
+                                      ? 'error'
+                                      : task.status === 'completed' || task.status === 'success'
+                                        ? 'success'
+                                        : 'info'
                                   }
                                   show-indicator={false}
                                   height={6}

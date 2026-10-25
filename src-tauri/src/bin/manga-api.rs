@@ -1,4 +1,11 @@
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, process::Stdio, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::PathBuf,
+    process::{ExitStatus, Stdio},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     body::Bytes,
@@ -8,13 +15,18 @@ use axum::{
     routing::{get, get_service},
     Json, Router,
 };
+use manga_downloader_lib::{
+    cli::{is_wnacg_collection_target, is_wnacg_index_target},
+    utils::temp_download_dir,
+    ComicCollection, ComicEpisode,
+};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
-    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
+    sync::{mpsc, watch, OwnedSemaphorePermit, RwLock, Semaphore},
 };
 use tower_http::{
     cors::CorsLayer,
@@ -25,9 +37,92 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     cli_path: String,
-    tasks: Arc<RwLock<HashMap<String, DownloadTask>>>,
-    task_db_path: Arc<PathBuf>,
+    task_manager: Arc<TaskManager>,
     provider_limits: Arc<ProviderLimits>,
+    download_queue: mpsc::UnboundedSender<QueuedDownload>,
+}
+
+struct QueuedDownload {
+    task_id: String,
+    query: DownloadQuery,
+    cancel_receiver: watch::Receiver<bool>,
+}
+
+const TASK_COOLDOWN: Duration = Duration::from_secs(60);
+
+struct TaskManager {
+    tasks: RwLock<HashMap<String, DownloadTask>>,
+    cancel_signals: RwLock<HashMap<String, watch::Sender<bool>>>,
+    task_db_path: PathBuf,
+}
+
+impl TaskManager {
+    fn new(task_db_path: PathBuf, tasks: HashMap<String, DownloadTask>) -> Self {
+        Self {
+            tasks: RwLock::new(tasks),
+            cancel_signals: RwLock::new(HashMap::new()),
+            task_db_path,
+        }
+    }
+
+    async fn insert(&self, task: DownloadTask) -> watch::Receiver<bool> {
+        let (cancel_signal, receiver) = watch::channel(false);
+        self.cancel_signals
+            .write()
+            .await
+            .insert(task.id.clone(), cancel_signal);
+        let mut tasks = self.tasks.write().await;
+        tasks.insert(task.id.clone(), task.clone());
+        persist_task(&self.task_db_path, &task).await;
+        receiver
+    }
+
+    async fn get(&self, id: &str) -> Option<DownloadTask> {
+        self.tasks.read().await.get(id).cloned()
+    }
+
+    async fn list(&self) -> Vec<DownloadTask> {
+        self.tasks.read().await.values().cloned().collect()
+    }
+
+    async fn update<F>(&self, id: &str, mut updater: F) -> Option<DownloadTask>
+    where
+        F: FnMut(&mut DownloadTask),
+    {
+        let mut tasks = self.tasks.write().await;
+        let task = tasks.get_mut(id)?;
+        updater(task);
+        let task = task.clone();
+        persist_task(&self.task_db_path, &task).await;
+        Some(task)
+    }
+
+    async fn cancel(&self, id: &str) -> Option<DownloadTask> {
+        let mut tasks = self.tasks.write().await;
+        let task = tasks.get_mut(id)?;
+        if !task.status.is_terminal() {
+            if task.status == TaskStatus::Queued {
+                task.status = TaskStatus::Cancelled;
+                task.finished_at = Some(now_string());
+            } else {
+                task.cancellation_requested = true;
+            }
+            task.updated_at = now_string();
+        }
+        let task = task.clone();
+
+        if !task.status.is_terminal() || task.status == TaskStatus::Cancelled {
+            if let Some(sender) = self.cancel_signals.read().await.get(id) {
+                sender.send_replace(true);
+            }
+        }
+        persist_task(&self.task_db_path, &task).await;
+        Some(task)
+    }
+
+    async fn remove_cancel_signal(&self, id: &str) {
+        self.cancel_signals.write().await.remove(id);
+    }
 }
 
 struct ProviderLimits {
@@ -117,6 +212,7 @@ struct TagSearchQuery {
 
 #[derive(Debug, Deserialize, Clone)]
 struct DownloadQuery {
+    #[serde(alias = "url", alias = "id")]
     target: String,
     format: Option<String>,
     img_concurrency: Option<usize>,
@@ -139,7 +235,11 @@ impl DownloadQuery {
     }
 
     fn comic_args(&self) -> Vec<String> {
-        let mut args = vec!["comic".to_string(), "--json".to_string(), self.target.clone()];
+        let mut args = vec![
+            "comic".to_string(),
+            "--json".to_string(),
+            self.target.clone(),
+        ];
         self.common_query().append_cli_args(&mut args);
         args
     }
@@ -176,6 +276,23 @@ struct CommandResponse {
     data: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TaskStatus {
+    Queued,
+    Downloading,
+    #[serde(alias = "success")]
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskStatus {
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadTask {
@@ -183,13 +300,17 @@ struct DownloadTask {
     target: String,
     #[serde(default)]
     provider: Option<String>,
-    status: String,
+    status: TaskStatus,
     title: Option<String>,
     cover: Option<String>,
     total_pages: Option<i64>,
     completed_pages: usize,
     error: Option<String>,
     zip_path: Option<String>,
+    #[serde(default)]
+    cancellation_requested: bool,
+    #[serde(default, skip_serializing)]
+    cleanup_dir: Option<PathBuf>,
     stdout: Vec<String>,
     stderr: Vec<String>,
     created_at: String,
@@ -202,7 +323,61 @@ struct DownloadTask {
 struct DownloadTaskResponse {
     #[serde(flatten)]
     task: DownloadTask,
+    #[serde(rename = "task_id")]
+    task_id: String,
+    progress: TaskProgress,
     message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectionDownloadResponse {
+    ok: bool,
+    collection_id: i64,
+    collection_title: String,
+    status: TaskStatus,
+    total_episodes: usize,
+    #[serde(rename = "task_ids")]
+    task_ids: Vec<String>,
+    tasks: Vec<DownloadTaskResponse>,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskProgress {
+    completed: usize,
+    total: Option<usize>,
+    percent: u8,
+}
+
+impl DownloadTaskResponse {
+    fn new(task: DownloadTask) -> Self {
+        let total = task
+            .total_pages
+            .and_then(|pages| usize::try_from(pages).ok());
+        let percent = if task.status == TaskStatus::Completed {
+            100
+        } else {
+            total
+                .filter(|total| *total > 0)
+                .map(|total| ((task.completed_pages.saturating_mul(100) / total).min(100)) as u8)
+                .unwrap_or(0)
+        };
+        let task_id = task.id.clone();
+        let message = task_message(&task);
+        let progress = TaskProgress {
+            completed: task.completed_pages,
+            total,
+            percent,
+        };
+        Self {
+            task,
+            task_id,
+            progress,
+            message,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -214,20 +389,71 @@ struct ComicInfo {
     image_count: i64,
 }
 
+enum ComicOrCollection {
+    Comic(ComicInfo),
+    Collection(ComicCollection),
+}
+
 impl DownloadTask {
-    fn new(task_id: String, target: String, comic_info: Option<&ComicInfo>, now: String) -> Self {
+    fn new(
+        task_id: String,
+        target: String,
+        comic_info: &ComicInfo,
+        cleanup_dir: PathBuf,
+        now: String,
+    ) -> Self {
+        Self::new_queued(
+            task_id,
+            target,
+            Some(comic_info.title.clone()),
+            Some(comic_info.cover.clone()),
+            Some(comic_info.image_count),
+            cleanup_dir,
+            now,
+        )
+    }
+
+    fn new_for_collection_episode(
+        task_id: String,
+        target: String,
+        episode: &ComicEpisode,
+        cleanup_dir: PathBuf,
+        now: String,
+    ) -> Self {
+        Self::new_queued(
+            task_id,
+            target,
+            Some(episode.title.clone()),
+            None,
+            None,
+            cleanup_dir,
+            now,
+        )
+    }
+
+    fn new_queued(
+        task_id: String,
+        target: String,
+        title: Option<String>,
+        cover: Option<String>,
+        total_pages: Option<i64>,
+        cleanup_dir: PathBuf,
+        now: String,
+    ) -> Self {
         let provider = Some(infer_provider(&target).to_string());
         Self {
             id: task_id,
             target,
             provider,
-            status: "downloading".to_string(),
-            title: comic_info.map(|comic| comic.title.clone()),
-            cover: comic_info.map(|comic| comic.cover.clone()),
-            total_pages: comic_info.map(|comic| comic.image_count),
+            status: TaskStatus::Queued,
+            title,
+            cover,
+            total_pages,
             completed_pages: 0,
             error: None,
             zip_path: None,
+            cancellation_requested: false,
+            cleanup_dir: Some(cleanup_dir),
             stdout: Vec::new(),
             stderr: Vec::new(),
             created_at: now.clone(),
@@ -251,11 +477,12 @@ async fn main() -> anyhow::Result<()> {
     let task_db_path = std::env::var("MANGA_TASK_STORE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/data/manga-tasks.sqlite"));
-    let tasks = Arc::new(RwLock::new(load_tasks(&task_db_path).await?));
+    let tasks = load_tasks(&task_db_path).await?;
     let provider_img_concurrency = std::env::var("MANGA_PROVIDER_IMG_CONCURRENCY")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(5);
+    let (download_queue, queue_receiver) = mpsc::unbounded_channel();
 
     let api_router = Router::new()
         .route("/health", get(health))
@@ -268,18 +495,23 @@ async fn main() -> anyhow::Result<()> {
             get(start_download).post(start_download_post),
         )
         .route("/tasks", get(list_tasks))
-        .route("/tasks/{id}", get(get_task));
+        .route("/tasks/{id}", get(get_task))
+        .route("/task/{id}", get(get_task))
+        .route("/task/{id}/cancel", axum::routing::post(cancel_task));
     let static_index = web_dist_path.join("index.html");
-    let static_service = get_service(
-        ServeDir::new(&web_dist_path).not_found_service(ServeFile::new(static_index)),
-    );
+    let static_service =
+        get_service(ServeDir::new(&web_dist_path).not_found_service(ServeFile::new(static_index)));
 
     let app_state = AppState {
         cli_path,
-        tasks,
-        task_db_path: Arc::new(task_db_path),
+        task_manager: Arc::new(TaskManager::new(task_db_path, tasks)),
         provider_limits: Arc::new(ProviderLimits::new(provider_img_concurrency)),
+        download_queue,
     };
+    let queue_state = app_state.clone();
+    tokio::spawn(async move {
+        run_download_queue(queue_state, queue_receiver).await;
+    });
     let app = Router::new()
         .nest("/api", api_router.clone())
         .merge(api_router)
@@ -305,6 +537,8 @@ async fn health() -> impl IntoResponse {
             "GET /download/start?target=<id-or-url>",
             "POST /download {\"target\":\"<id-or-url>\"}",
             "POST /download/start {\"target\":\"<id-or-url>\"}",
+            "GET /task/<id>",
+            "POST /task/<id>/cancel",
             "GET /tasks",
             "GET /tasks/<id>"
         ]
@@ -355,7 +589,10 @@ async fn search_tag(
     run_cli_json(&state.cli_path, args).await
 }
 
-async fn get_comic(State(state): State<AppState>, Query(query): Query<DownloadQuery>) -> impl IntoResponse {
+async fn get_comic(
+    State(state): State<AppState>,
+    Query(query): Query<DownloadQuery>,
+) -> impl IntoResponse {
     run_cli_json(&state.cli_path, query.comic_args()).await
 }
 
@@ -378,34 +615,223 @@ async fn start_download_post(
 }
 
 async fn create_download_task(state: AppState, query: DownloadQuery) -> axum::response::Response {
-    let task_id = Uuid::new_v4().to_string();
-    let now = now_string();
+    if is_wnacg_collection_target(&query.target) {
+        return create_collection_download_tasks(state, query).await;
+    }
 
-    let comic_info = fetch_comic_info(&state.cli_path, &query).await.ok();
-    let task = DownloadTask::new(task_id.clone(), query.target.clone(), comic_info.as_ref(), now);
+    if is_wnacg_index_target(&query.target) {
+        return match fetch_comic_or_collection(&state.cli_path, &query).await {
+            Ok(ComicOrCollection::Collection(collection)) => {
+                create_collection_download_tasks_from_info(state, query, collection).await
+            }
+            Ok(ComicOrCollection::Comic(comic_info)) => {
+                create_single_download_task(state, query, comic_info).await
+            }
+            Err(err) => error_message_response(
+                StatusCode::BAD_GATEWAY,
+                format!("解析漫画信息失败：{err:#}"),
+            ),
+        };
+    }
 
-    state
-        .tasks
-        .write()
-        .await
-        .insert(task_id.clone(), task.clone());
-    persist_task(state.task_db_path.as_ref(), &task).await;
+    let comic_info = match fetch_comic_info(&state.cli_path, &query).await {
+        Ok(comic) => comic,
+        Err(err) => {
+            return error_message_response(
+                StatusCode::BAD_GATEWAY,
+                format!("解析漫画信息失败：{err:#}"),
+            );
+        }
+    };
+    create_single_download_task(state, query, comic_info).await
+}
 
-    let state_for_task = state.clone();
-    tokio::spawn(async move {
-        run_download_task(state_for_task, task_id, query).await;
-    });
+async fn create_single_download_task(
+    state: AppState,
+    query: DownloadQuery,
+    comic_info: ComicInfo,
+) -> axum::response::Response {
+    let provider = infer_provider(&query.target);
+    let download_root = match resolve_download_root(&query) {
+        Ok(path) => path,
+        Err(err) => {
+            return error_message_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("读取下载目录配置失败：{err:#}"),
+            );
+        }
+    };
+    let cleanup_dir = temp_download_dir(&download_root, provider, comic_info.id, &comic_info.title);
+    let task = DownloadTask::new(
+        Uuid::new_v4().to_string(),
+        query.target.clone(),
+        &comic_info,
+        cleanup_dir,
+        now_string(),
+    );
+    let response = enqueue_download_task(&state, task, query).await;
 
-    let message = format!("开始下载：{}", task_title_for_message(&task));
+    (StatusCode::ACCEPTED, Json(response)).into_response()
+}
+
+async fn create_collection_download_tasks(
+    state: AppState,
+    query: DownloadQuery,
+) -> axum::response::Response {
+    let collection = match fetch_collection_info(&state.cli_path, &query).await {
+        Ok(collection) => collection,
+        Err(err) => {
+            return error_message_response(
+                StatusCode::BAD_GATEWAY,
+                format!("解析合集分集失败：{err:#}"),
+            );
+        }
+    };
+    create_collection_download_tasks_from_info(state, query, collection).await
+}
+
+async fn create_collection_download_tasks_from_info(
+    state: AppState,
+    query: DownloadQuery,
+    collection: ComicCollection,
+) -> axum::response::Response {
+    if collection.episodes.is_empty() {
+        return error_message_response(StatusCode::BAD_GATEWAY, "合集没有可下载的分集".to_string());
+    }
+
+    let download_root = match resolve_download_root(&query) {
+        Ok(path) => path,
+        Err(err) => {
+            return error_message_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("读取下载目录配置失败：{err:#}"),
+            );
+        }
+    };
+    let collection_title = collection.title.clone();
+    let total_episodes = collection.episodes.len();
+    let mut tasks = Vec::with_capacity(total_episodes);
+    for episode in &collection.episodes {
+        let target = episode.url.clone();
+        let cleanup_dir = temp_download_dir(&download_root, "wnacg", episode.id, &episode.title);
+        let task = DownloadTask::new_for_collection_episode(
+            Uuid::new_v4().to_string(),
+            target.clone(),
+            episode,
+            cleanup_dir,
+            now_string(),
+        );
+        let mut episode_query = query.clone();
+        episode_query.target = target;
+        tasks.push(enqueue_download_task(&state, task, episode_query).await);
+    }
+
+    let task_ids = tasks.iter().map(|task| task.task_id.clone()).collect();
     (
-        StatusCode::OK,
-        Json(DownloadTaskResponse { task, message }),
+        StatusCode::ACCEPTED,
+        Json(CollectionDownloadResponse {
+            ok: true,
+            collection_id: collection.id,
+            collection_title: collection_title.clone(),
+            status: TaskStatus::Queued,
+            total_episodes,
+            task_ids,
+            tasks,
+            message: collection_title,
+        }),
     )
         .into_response()
 }
 
+async fn enqueue_download_task(
+    state: &AppState,
+    task: DownloadTask,
+    query: DownloadQuery,
+) -> DownloadTaskResponse {
+    let task_id = task.id.clone();
+    let cancel_receiver = state.task_manager.insert(task.clone()).await;
+    if state
+        .download_queue
+        .send(QueuedDownload {
+            task_id: task_id.clone(),
+            query,
+            cancel_receiver,
+        })
+        .is_err()
+    {
+        update_task(state, &task_id, |task| {
+            task.status = TaskStatus::Failed;
+            task.error = Some("下载队列不可用".to_string());
+            task.finished_at = Some(now_string());
+            task.updated_at = now_string();
+        })
+        .await;
+        state.task_manager.remove_cancel_signal(&task_id).await;
+    }
+
+    state
+        .task_manager
+        .get(&task_id)
+        .await
+        .map(DownloadTaskResponse::new)
+        .unwrap_or_else(|| DownloadTaskResponse::new(task))
+}
+
+async fn run_download_queue(
+    state: AppState,
+    mut queue_receiver: mpsc::UnboundedReceiver<QueuedDownload>,
+) {
+    while let Some(queued) = queue_receiver.recv().await {
+        let finished_download = run_download_task(
+            state.clone(),
+            queued.task_id,
+            queued.query,
+            queued.cancel_receiver,
+        )
+        .await;
+        if finished_download {
+            tokio::time::sleep(TASK_COOLDOWN).await;
+        }
+    }
+}
+
 fn task_title_for_message(task: &DownloadTask) -> &str {
     task.title.as_deref().unwrap_or(task.target.as_str())
+}
+
+fn task_message(task: &DownloadTask) -> String {
+    if task.status == TaskStatus::Failed {
+        task.error.clone().unwrap_or_else(|| "未知错误".to_string())
+    } else {
+        task_title_for_message(task).to_string()
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct DownloadDirectoryConfig {
+    default_download_dir: Option<PathBuf>,
+}
+
+fn resolve_download_root(query: &DownloadQuery) -> anyhow::Result<PathBuf> {
+    if let Some(download_dir) = &query.download_dir {
+        return Ok(PathBuf::from(download_dir));
+    }
+
+    let config_path = query
+        .config
+        .as_deref()
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("MANGA_CLI_CONFIG").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/config/manga-cli.json"));
+    if config_path.exists() {
+        let contents = std::fs::read_to_string(&config_path)?;
+        let config: DownloadDirectoryConfig = serde_json::from_str(&contents)?;
+        if let Some(download_dir) = config.default_download_dir {
+            return Ok(download_dir);
+        }
+    }
+
+    Ok(std::env::current_dir()?.join("downloads"))
 }
 
 fn error_message_response(status: StatusCode, error: String) -> axum::response::Response {
@@ -449,55 +875,116 @@ fn parse_download_post_body(headers: &HeaderMap, body: &[u8]) -> anyhow::Result<
 }
 
 async fn list_tasks(State(state): State<AppState>) -> impl IntoResponse {
-    let mut tasks = state.tasks.read().await.values().cloned().collect::<Vec<_>>();
+    let mut tasks = state.task_manager.list().await;
     tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let tasks = tasks
+        .into_iter()
+        .map(DownloadTaskResponse::new)
+        .collect::<Vec<_>>();
     Json(json!({ "tasks": tasks }))
 }
 
 async fn get_task(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    match state.tasks.read().await.get(&id).cloned() {
-        Some(task) => (StatusCode::OK, Json(json!(task))).into_response(),
+    match state.task_manager.get(&id).await {
+        Some(task) => (StatusCode::OK, Json(DownloadTaskResponse::new(task))).into_response(),
         None => (
             StatusCode::NOT_FOUND,
-            Json(json!({ "ok": false, "error": format!("task `{id}` not found") })),
+            Json(json!({
+                "ok": false,
+                "error": format!("task `{id}` not found"),
+                "message": format!("task `{id}` not found")
+            })),
         )
             .into_response(),
     }
 }
 
-async fn run_download_task(state: AppState, task_id: String, mut query: DownloadQuery) {
+async fn cancel_task(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    match state.task_manager.cancel(&id).await {
+        Some(task) => (StatusCode::OK, Json(DownloadTaskResponse::new(task))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": format!("task `{id}` not found"),
+                "message": format!("task `{id}` not found")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn run_download_task(
+    state: AppState,
+    task_id: String,
+    mut query: DownloadQuery,
+    mut cancel_receiver: watch::Receiver<bool>,
+) -> bool {
     let provider = infer_provider(&query.target);
+    let mut is_queued = false;
     update_task(&state, &task_id, |task| {
-        task.stdout.push(format!("waiting for {provider} download slot"));
-        task.updated_at = now_string();
+        if task.status == TaskStatus::Queued {
+            task.stdout
+                .push("waiting in the serial download queue".to_string());
+            task.updated_at = now_string();
+            is_queued = true;
+        }
     })
     .await;
+    if !is_queued {
+        state.task_manager.remove_cancel_signal(&task_id).await;
+        return false;
+    }
 
-    let _provider_permit = match state.provider_limits.acquire(provider).await {
-        Ok(permit) => permit,
-        Err(err) => {
+    let acquisition = tokio::select! {
+        biased;
+        changed = cancel_receiver.changed() => {
+            let _ = changed;
+            None
+        }
+        result = state.provider_limits.acquire(provider) => Some(result),
+    };
+    let _provider_permit = match acquisition {
+        None => {
+            finish_cancelled(&state, &task_id).await;
+            state.task_manager.remove_cancel_signal(&task_id).await;
+            return false;
+        }
+        Some(Ok(permit)) => permit,
+        Some(Err(err)) => {
             update_task(&state, &task_id, |task| {
-                task.status = "failed".to_string();
+                task.status = TaskStatus::Failed;
                 task.error = Some(err.to_string());
                 task.finished_at = Some(now_string());
                 task.updated_at = now_string();
             })
             .await;
-            return;
+            state.task_manager.remove_cancel_signal(&task_id).await;
+            return false;
         }
     };
+
+    let mut started = false;
     state.provider_limits.cap_query(&mut query);
     let capped_img_concurrency = query
         .img_concurrency
         .unwrap_or(state.provider_limits.img_concurrency);
     update_task(&state, &task_id, |task| {
-        task.stdout.push(format!(
-            "started {provider} download with shared image concurrency {}",
-            capped_img_concurrency
-        ));
-        task.updated_at = now_string();
+        if task.status == TaskStatus::Queued && !task.cancellation_requested {
+            task.status = TaskStatus::Downloading;
+            task.stdout.push(format!(
+                "started {provider} download with shared image concurrency {}",
+                capped_img_concurrency
+            ));
+            task.updated_at = now_string();
+            started = true;
+        }
     })
     .await;
+    if !started {
+        state.task_manager.remove_cancel_signal(&task_id).await;
+        return false;
+    }
 
     let args = query.download_args();
     let mut command = Command::new(&state.cli_path);
@@ -512,13 +999,14 @@ async fn run_download_task(state: AppState, task_id: String, mut query: Download
         Ok(child) => child,
         Err(err) => {
             update_task(&state, &task_id, |task| {
-                task.status = "failed".to_string();
+                task.status = TaskStatus::Failed;
                 task.error = Some(format!("启动下载任务失败: {err}"));
                 task.finished_at = Some(now_string());
                 task.updated_at = now_string();
             })
             .await;
-            return;
+            state.task_manager.remove_cancel_signal(&task_id).await;
+            return true;
         }
     };
 
@@ -551,36 +1039,109 @@ async fn run_download_task(state: AppState, task_id: String, mut query: Download
         }
     });
 
-    let status = child.wait().await.ok();
+    enum DownloadOutcome {
+        Cancelled,
+        Exited(std::io::Result<ExitStatus>),
+    }
+    let outcome = tokio::select! {
+        biased;
+        changed = cancel_receiver.changed() => {
+            if changed.is_ok() && *cancel_receiver.borrow() {
+                match child.try_wait() {
+                    Ok(Some(status)) => DownloadOutcome::Exited(Ok(status)),
+                    _ => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        DownloadOutcome::Cancelled
+                    }
+                }
+            } else {
+                DownloadOutcome::Exited(child.wait().await)
+            }
+        }
+        status = child.wait() => DownloadOutcome::Exited(status),
+    };
     let _ = stdout_handle.await;
     let _ = stderr_handle.await;
 
-    update_task(&state, &task_id, |task| {
-        task.updated_at = now_string();
-        task.finished_at = Some(now_string());
+    match outcome {
+        DownloadOutcome::Cancelled => {
+            cleanup_cancelled_task(&state, &task_id).await;
+            finish_cancelled(&state, &task_id).await;
+        }
+        DownloadOutcome::Exited(status) => {
+            update_task(&state, &task_id, |task| {
+                task.updated_at = now_string();
+                task.finished_at = Some(now_string());
 
-        if status.is_some_and(|status| status.success()) {
-            task.status = "success".to_string();
-            if let Some(total_pages) = task.total_pages {
-                task.completed_pages = total_pages as usize;
-            }
-            if task.title.is_none() {
-                task.title = Some(task.target.clone());
-            }
-        } else {
-            task.status = "failed".to_string();
-            if task.error.is_none() {
-                let last_error = task
-                    .stderr
-                    .last()
-                    .cloned()
-                    .or_else(|| task.stdout.last().cloned())
-                    .unwrap_or_else(|| "下载失败".to_string());
-                task.error = Some(last_error);
-            }
+                if status.as_ref().is_ok_and(ExitStatus::success) {
+                    task.status = TaskStatus::Completed;
+                    if let Some(total_pages) = task.total_pages {
+                        task.completed_pages = total_pages.max(0) as usize;
+                    }
+                    if task.title.is_none() {
+                        task.title = Some(task.target.clone());
+                    }
+                } else {
+                    task.status = TaskStatus::Failed;
+                    if task.error.is_none() {
+                        let last_error = status
+                            .as_ref()
+                            .err()
+                            .map(ToString::to_string)
+                            .or_else(|| task.stderr.last().cloned())
+                            .or_else(|| task.stdout.last().cloned())
+                            .unwrap_or_else(|| "下载失败".to_string());
+                        task.error = Some(last_error);
+                    }
+                }
+                task.cancellation_requested = false;
+                task.updated_at = now_string();
+            })
+            .await;
+        }
+    }
+    state.task_manager.remove_cancel_signal(&task_id).await;
+    true
+}
+
+async fn finish_cancelled(state: &AppState, task_id: &str) {
+    update_task(state, task_id, |task| {
+        if !task.status.is_terminal() {
+            task.status = TaskStatus::Cancelled;
+            task.cancellation_requested = false;
+            task.finished_at = Some(now_string());
+            task.updated_at = now_string();
         }
     })
     .await;
+}
+
+async fn cleanup_cancelled_task(state: &AppState, task_id: &str) {
+    let Some(path) = state
+        .task_manager
+        .get(task_id)
+        .await
+        .and_then(|task| task.cleanup_dir)
+    else {
+        return;
+    };
+    let is_task_temp_dir = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".下载中-"));
+    if !is_task_temp_dir {
+        return;
+    }
+    if let Err(err) = tokio::fs::remove_dir_all(&path).await {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            update_task(state, task_id, |task| {
+                task.error = Some(format!("{}: {err}", path.display()));
+                task.updated_at = now_string();
+            })
+            .await;
+        }
+    }
 }
 
 async fn handle_stdout_line(state: &AppState, task_id: &str, line: &str) {
@@ -601,21 +1162,11 @@ async fn handle_stdout_line(state: &AppState, task_id: &str, line: &str) {
     .await;
 }
 
-async fn update_task<F>(state: &AppState, task_id: &str, mut updater: F)
+async fn update_task<F>(state: &AppState, task_id: &str, updater: F)
 where
     F: FnMut(&mut DownloadTask),
 {
-    let mut changed_task = None;
-    {
-        let mut tasks = state.tasks.write().await;
-        if let Some(task) = tasks.get_mut(task_id) {
-            updater(task);
-            changed_task = Some(task.clone());
-        }
-    }
-    if let Some(task) = changed_task {
-        persist_task(state.task_db_path.as_ref(), &task).await;
-    }
+    state.task_manager.update(task_id, updater).await;
 }
 
 async fn persist_task(path: &PathBuf, task: &DownloadTask) {
@@ -661,6 +1212,19 @@ fn load_tasks_blocking(path: &PathBuf) -> anyhow::Result<HashMap<String, Downloa
                 tasks = imported;
             }
         }
+    }
+    let mut interrupted = Vec::new();
+    for task in tasks.values_mut() {
+        if matches!(task.status, TaskStatus::Queued | TaskStatus::Downloading) {
+            task.status = TaskStatus::Failed;
+            task.error = Some("服务重启时任务中断".to_string());
+            task.finished_at = Some(now_string());
+            task.updated_at = now_string();
+            interrupted.push(task.clone());
+        }
+    }
+    if !interrupted.is_empty() {
+        persist_task_batch(&conn, interrupted.iter())?;
     }
     Ok(tasks)
 }
@@ -757,6 +1321,34 @@ async fn fetch_comic_info(cli_path: &str, query: &DownloadQuery) -> anyhow::Resu
     serde_json::from_str(&response.stdout).map_err(Into::into)
 }
 
+async fn fetch_comic_or_collection(
+    cli_path: &str,
+    query: &DownloadQuery,
+) -> anyhow::Result<ComicOrCollection> {
+    let response = run_cli(cli_path, query.comic_args()).await?;
+    if !response.ok {
+        anyhow::bail!(response.stderr);
+    }
+
+    let value: Value = serde_json::from_str(&response.stdout)?;
+    if value.get("episodes").is_some() {
+        Ok(ComicOrCollection::Collection(serde_json::from_value(value)?))
+    } else {
+        Ok(ComicOrCollection::Comic(serde_json::from_value(value)?))
+    }
+}
+
+async fn fetch_collection_info(
+    cli_path: &str,
+    query: &DownloadQuery,
+) -> anyhow::Result<ComicCollection> {
+    let response = run_cli(cli_path, query.comic_args()).await?;
+    if !response.ok {
+        anyhow::bail!(response.stderr);
+    }
+    serde_json::from_str(&response.stdout).map_err(Into::into)
+}
+
 async fn run_cli_json(cli_path: &str, args: Vec<String>) -> axum::response::Response {
     match run_cli(cli_path, args).await {
         Ok(mut payload) => {
@@ -786,7 +1378,6 @@ fn command_error_response(err: anyhow::Error) -> axum::response::Response {
     )
         .into_response()
 }
-
 
 async fn run_cli(cli_path: &str, args: Vec<String>) -> anyhow::Result<CommandResponse> {
     let output = Command::new(cli_path)

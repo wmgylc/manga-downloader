@@ -26,7 +26,7 @@ use zip::write::SimpleFileOptions;
 
 use crate::{
     types::DownloadFormat,
-    utils::{filename_filter, md5_hex},
+    utils::{build_download_dir_name, filename_filter, md5_hex, temp_download_dir},
 };
 
 const DEFAULT_API_DOMAIN: &str = "www.cdnhth.cc";
@@ -407,8 +407,13 @@ impl JmClient {
         options: &JmDownloadOptions,
     ) -> anyhow::Result<JmDownloadPlan> {
         let detail = self.fetch_detail(input).await?;
-        let safe_dir_name = build_download_dir_name(detail.comic.id, &detail.title());
-        let temp_dir = options.download_dir.join(format!(".下载中-{safe_dir_name}"));
+        let temp_dir = temp_download_dir(
+            &options.download_dir,
+            "jmcomic",
+            detail.comic.id,
+            &detail.title(),
+        );
+        let safe_dir_name = build_download_dir_name("jmcomic", detail.comic.id, &detail.title());
         let final_dir = options.download_dir.join(safe_dir_name);
 
         let mut chapters = Vec::new();
@@ -1212,41 +1217,6 @@ fn create_zip_archive_recursive(download_dir: &Path) -> anyhow::Result<PathBuf> 
         .finish()
         .with_context(|| format!("关闭 zip 文件 `{}` 失败", zip_path.display()))?;
     Ok(zip_path)
-}
-
-fn build_download_dir_name(comic_id: i64, title: &str) -> String {
-    const MAX_NAME_BYTES: usize = 180;
-
-    let sanitized = filename_filter(title).trim().to_string();
-    let sanitized = if sanitized.is_empty() {
-        format!("JMComic {comic_id}")
-    } else {
-        format!("{sanitized} [JM{comic_id}]")
-    };
-    if sanitized.len() <= MAX_NAME_BYTES {
-        return sanitized;
-    }
-
-    let suffix = format!(" [JM{comic_id}]");
-    let available = MAX_NAME_BYTES.saturating_sub(suffix.len());
-    let truncated = truncate_utf8_by_bytes(&sanitized, available);
-    format!("{truncated}{suffix}")
-}
-
-fn truncate_utf8_by_bytes(input: &str, max_bytes: usize) -> String {
-    if input.len() <= max_bytes {
-        return input.to_string();
-    }
-
-    let mut end = 0;
-    for (idx, ch) in input.char_indices() {
-        let next = idx + ch.len_utf8();
-        if next > max_bytes {
-            break;
-        }
-        end = next;
-    }
-    input[..end].trim_end().to_string()
 }
 
 fn desktop_user_agent() -> &'static str {

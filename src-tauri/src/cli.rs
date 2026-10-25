@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashSet, VecDeque},
     io::Cursor,
     path::{Path, PathBuf},
     sync::{
@@ -22,13 +23,14 @@ use zip::write::SimpleFileOptions;
 use crate::{
     config::DEFAULT_API_DOMAIN,
     jmcomic,
-    types::{Comic, DownloadFormat, ImgList, SearchResult},
-    utils::filename_filter,
+    types::{Comic, ComicCollection, ComicEpisode, DownloadFormat, ImgList, SearchResult},
+    utils::{build_download_dir_name, filename_filter, temp_download_dir},
 };
 
 const API_TIMEOUT_SECS: u64 = 30;
 const IMAGE_TIMEOUT_SECS: u64 = 60;
 const CLIENT_RETRY_WINDOW_SECS: u64 = 15;
+const MAX_COLLECTION_PAGES: i64 = 100;
 
 #[derive(Parser, Debug)]
 #[command(name = "manga-cli", about = "Search and download manga from the terminal")]
@@ -147,7 +149,6 @@ struct DownloadOptions {
 #[derive(Debug, Default, Deserialize)]
 struct CliConfig {
     webhook_url: Option<String>,
-    bark_url: Option<String>,
     default_download_dir: Option<PathBuf>,
     default_img_concurrency: Option<usize>,
     default_img_interval_sec: Option<u64>,
@@ -167,11 +168,6 @@ struct WebhookPayload {
     completed_images: usize,
     total_images: usize,
     reason: Option<String>,
-}
-
-enum NotificationTarget<'a> {
-    Webhook(&'a str),
-    Bark(&'a str),
 }
 
 struct DownloadSuccess {
@@ -247,6 +243,38 @@ async fn run_comic(args: ComicArgs) -> anyhow::Result<()> {
     let cli_config = load_cli_config(args.common.config.as_deref())?;
     let download_dir = resolve_download_dir(args.common.download_dir, &cli_config);
     let client = CliClient::new(&args.common.api_domain, args.common.proxy.as_deref())?;
+    let is_collection_page = is_wnacg_collection_target(&args.target);
+    // The unsuffixed WNACG index path can refer to either a collection or a single comic.
+    if is_collection_page || is_wnacg_index_target(&args.target) {
+        let collection_id = extract_comic_id(&args.target)?;
+        match client.get_collection(collection_id).await {
+            Ok(collection) => {
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&collection)
+                            .context("序列化合集信息失败")?
+                    );
+                } else {
+                    println!(
+                        "[{}] {} | {} episodes",
+                        collection.id,
+                        collection.title,
+                        collection.episodes.len()
+                    );
+                    for episode in collection.episodes {
+                        println!("[{}] {}", episode.id, episode.title);
+                    }
+                }
+                return Ok(());
+            }
+            Err(err) if is_collection_page => {
+                return Err(err).with_context(|| format!("获取合集 `{collection_id}` 分集失败"));
+            }
+            Err(_) => {}
+        }
+    }
+
     let comic_id = client
         .resolve_comic_id(&args.target)
         .await
@@ -826,6 +854,64 @@ impl CliClient {
             .context("解析漫画详情失败")
     }
 
+    async fn get_collection(&self, id: i64) -> anyhow::Result<ComicCollection> {
+        let mut page_queue = VecDeque::from([1_i64]);
+        let mut scheduled_pages = HashSet::from([1_i64]);
+        let mut seen_episode_ids = HashSet::new();
+        let mut collection_title = None;
+        let mut episodes = Vec::new();
+
+        while let Some(page) = page_queue.pop_front() {
+            if page > MAX_COLLECTION_PAGES {
+                anyhow::bail!("合集分页数超过限制（{MAX_COLLECTION_PAGES}），拒绝继续抓取");
+            }
+            let url = format!(
+                "https://{}/photos-index-aid-{id}-page-{page}.html",
+                self.api_domain
+            );
+            let response = self
+                .api_client
+                .get(&url)
+                .header("referer", format!("https://{}/", self.api_domain))
+                .send()
+                .await
+                .with_context(|| format!("请求合集分页 `{url}` 失败"))?;
+            let status = response.status();
+            let body = response.text().await?;
+            if status != StatusCode::OK {
+                anyhow::bail!("请求合集分页 `{url}` 返回异常状态码({status}): {body}");
+            }
+
+            let parsed = parse_collection_page(id, &self.api_domain, &body)?;
+            collection_title.get_or_insert(parsed.title);
+            for next_page in parsed.pages {
+                if next_page > MAX_COLLECTION_PAGES {
+                    anyhow::bail!(
+                        "合集分页数超过限制（{MAX_COLLECTION_PAGES}），拒绝继续抓取"
+                    );
+                }
+                if scheduled_pages.insert(next_page) {
+                    page_queue.push_back(next_page);
+                }
+            }
+            for episode in parsed.episodes {
+                if seen_episode_ids.insert(episode.id) {
+                    episodes.push(episode);
+                }
+            }
+        }
+
+        if episodes.is_empty() {
+            anyhow::bail!("合集页面中没有找到分集漫画链接");
+        }
+
+        Ok(ComicCollection {
+            id,
+            title: collection_title.context("没有解析到合集标题")?,
+            episodes,
+        })
+    }
+
     async fn resolve_comic_id(&self, input: &str) -> anyhow::Result<i64> {
         if let Ok(id) = extract_comic_id(input) {
             return Ok(id);
@@ -895,10 +981,13 @@ async fn download_comic(
     comic: &Comic,
     options: &DownloadOptions,
 ) -> Result<DownloadSuccess, DownloadFailure> {
-    let safe_dir_name = build_download_dir_name(comic.id, &comic.title);
-    let temp_download_dir = options
-        .download_dir
-        .join(format!(".下载中-{safe_dir_name}"));
+    let safe_dir_name = build_download_dir_name("wnacg", comic.id, &comic.title);
+    let temp_download_dir = temp_download_dir(
+        &options.download_dir,
+        "wnacg",
+        comic.id,
+        &comic.title,
+    );
     let final_download_dir = options.download_dir.join(&safe_dir_name);
     std::fs::create_dir_all(&temp_download_dir).map_err(|err| DownloadFailure {
         title: comic.title.clone(),
@@ -1249,6 +1338,122 @@ fn load_cli_config(config_path: Option<&Path>) -> anyhow::Result<CliConfig> {
     Ok(config)
 }
 
+pub fn is_wnacg_collection_target(target: &str) -> bool {
+    let path = Url::parse(target)
+        .map(|url| url.path().to_ascii_lowercase())
+        .unwrap_or_else(|_| target.to_ascii_lowercase());
+    path.contains("photos-index-aid-") && path.contains("-page-")
+}
+
+pub fn is_wnacg_index_target(target: &str) -> bool {
+    let path = Url::parse(target)
+        .map(|url| url.path().to_ascii_lowercase())
+        .unwrap_or_else(|_| target.to_ascii_lowercase());
+    let Some(file_name) = path.rsplit('/').next() else {
+        return false;
+    };
+    file_name
+        .strip_prefix("photos-index-aid-")
+        .and_then(|id| id.strip_suffix(".html"))
+        .is_some_and(|id| id.parse::<i64>().is_ok())
+}
+
+struct ParsedCollectionPage {
+    title: String,
+    pages: Vec<i64>,
+    episodes: Vec<ComicEpisode>,
+}
+
+fn parse_collection_page(
+    collection_id: i64,
+    api_domain: &str,
+    html: &str,
+) -> anyhow::Result<ParsedCollectionPage> {
+    let document = scraper::Html::parse_document(html);
+    let title_selector = scraper::Selector::parse("#bodywrap > h2")
+        .map_err(|err| anyhow!("解析合集标题选择器失败: {err:?}"))?;
+    let title = document
+        .select(&title_selector)
+        .next()
+        .map(|heading| heading.text().collect::<String>())
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        anyhow::bail!("合集页面中没有找到标题");
+    }
+
+    let page_selector = scraper::Selector::parse(&format!(
+        r#"a[href*="photos-index-aid-{collection_id}-page-"]"#
+    ))
+    .map_err(|err| anyhow!("解析合集分页链接选择器失败: {err:?}"))?;
+    let mut pages = Vec::new();
+    for link in document.select(&page_selector) {
+        if let Some(href) = link.value().attr("href") {
+            if let Some(page) = extract_collection_page_number(href, collection_id) {
+                pages.push(page);
+            }
+        }
+    }
+
+    let episode_selector =
+        scraper::Selector::parse(r#"a[href*="photos-slide-aid-"][href*="-sid-"]"#)
+            .map_err(|err| anyhow!("解析合集分集链接选择器失败: {err:?}"))?;
+    let series_marker = format!("-sid-{collection_id}.html");
+    let mut episodes = Vec::new();
+    for link in document.select(&episode_selector) {
+        if link.value().attr("id") == Some("reader-btn") {
+            continue;
+        }
+        let Some(href) = link.value().attr("href") else {
+            continue;
+        };
+        if !href
+            .split('?')
+            .next()
+            .unwrap_or(href)
+            .ends_with(&series_marker)
+        {
+            continue;
+        }
+
+        let episode_id = extract_comic_id(href)
+            .with_context(|| format!("解析合集分集链接 `{href}` 中的漫画 ID 失败"))?;
+        let raw_title = link.text().collect::<String>();
+        let normalized_title = raw_title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let title = if normalized_title.is_empty() {
+            format!("WNACG {episode_id}")
+        } else {
+            filename_filter(&normalized_title)
+        };
+        episodes.push(ComicEpisode {
+            id: episode_id,
+            title,
+            url: format!(
+                "https://{api_domain}/photos-slide-aid-{episode_id}-sid-{collection_id}.html"
+            ),
+        });
+    }
+
+    Ok(ParsedCollectionPage {
+        title: filename_filter(&title),
+        pages,
+        episodes,
+    })
+}
+
+fn extract_collection_page_number(href: &str, collection_id: i64) -> Option<i64> {
+    let marker = format!("photos-index-aid-{collection_id}-page-");
+    let start = href.find(&marker)? + marker.len();
+    let digits = href[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    let page = digits.parse::<i64>().ok()?;
+    (page > 0).then_some(page)
+}
+
 fn extract_comic_id(input: &str) -> anyhow::Result<i64> {
     if let Ok(id) = input.parse::<i64>() {
         return Ok(id);
@@ -1266,6 +1471,72 @@ fn extract_comic_id(input: &str) -> anyhow::Result<i64> {
         return Err(anyhow!("没有解析到数字 ID"));
     }
     digits.parse::<i64>().context("解析漫画 ID 失败")
+}
+
+#[cfg(test)]
+mod collection_tests {
+    use super::{
+        extract_collection_page_number, is_wnacg_collection_target, is_wnacg_index_target,
+        parse_collection_page,
+    };
+
+    #[test]
+    fn recognizes_paginated_wnacg_collection_urls() {
+        assert!(is_wnacg_collection_target(
+            "https://www.wnacg.com/photos-index-aid-397051-page-1.html"
+        ));
+        assert!(!is_wnacg_collection_target(
+            "https://www.wnacg.com/photos-index-aid-309685.html"
+        ));
+        assert!(is_wnacg_index_target(
+            "https://www.wnacg.com/photos-index-aid-397051.html"
+        ));
+        assert!(!is_wnacg_index_target(
+            "https://www.wnacg.com/photos-index-aid-397051-page-1.html"
+        ));
+    }
+
+    #[test]
+    fn extracts_only_matching_collection_pages_and_episodes() {
+        let html = r#"
+            <div id="bodywrap">
+              <h2>Example Collection</h2>
+              <a href="/photos-index-aid-99-page-3.html">3</a>
+              <a href="/photos-index-aid-100-page-8.html">8</a>
+              <a id="reader-btn" href="/photos-slide-aid-10-sid-99.html">Read</a>
+              <a class="tagshow" href="/photos-slide-aid-10-sid-99.html">Episode One</a>
+              <a class="tagshow" href="/photos-slide-aid-11-sid-99.html">Episode Two</a>
+              <a class="tagshow" href="/photos-slide-aid-12-sid-100.html">Other Collection</a>
+            </div>
+        "#;
+
+        let page = parse_collection_page(99, "www.wnacg.com", html).unwrap();
+        assert_eq!(page.title, "Example Collection");
+        assert_eq!(page.pages, vec![3]);
+        assert_eq!(page.episodes.len(), 2);
+        assert_eq!(page.episodes[0].id, 10);
+        assert_eq!(page.episodes[0].title, "Episode One");
+        assert_eq!(
+            page.episodes[0].url,
+            "https://www.wnacg.com/photos-slide-aid-10-sid-99.html"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_collection_page_numbers() {
+        assert_eq!(
+            extract_collection_page_number("/photos-index-aid-99-page-2.html", 99),
+            Some(2)
+        );
+        assert_eq!(
+            extract_collection_page_number("/photos-index-aid-99-page-0.html", 99),
+            None
+        );
+        assert_eq!(
+            extract_collection_page_number("/photos-index-aid-99-page-101.html", 99),
+            Some(101)
+        );
+    }
 }
 
 fn extract_comic_id_from_html(body: &str) -> anyhow::Result<i64> {
@@ -1363,65 +1634,18 @@ fn create_zip_archive(download_dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(zip_path)
 }
 
-fn build_download_dir_name(comic_id: i64, title: &str) -> String {
-    const MAX_NAME_BYTES: usize = 180;
-
-    let sanitized = filename_filter(title).trim().to_string();
-    if sanitized.is_empty() {
-        return comic_id.to_string();
-    }
-    if sanitized.len() <= MAX_NAME_BYTES {
-        return sanitized;
-    }
-
-    let suffix = format!(" [{comic_id}]");
-    let available = MAX_NAME_BYTES.saturating_sub(suffix.len());
-    let truncated = truncate_utf8_by_bytes(&sanitized, available);
-    format!("{truncated}{suffix}")
-}
-
-fn truncate_utf8_by_bytes(input: &str, max_bytes: usize) -> String {
-    if input.len() <= max_bytes {
-        return input.to_string();
-    }
-
-    let mut end = 0;
-    for (idx, ch) in input.char_indices() {
-        let next = idx + ch.len_utf8();
-        if next > max_bytes {
-            break;
-        }
-        end = next;
-    }
-
-    input[..end].trim_end().to_string()
-}
-
 async fn notify_download_result(
     client: &CliClient,
     cli_config: &CliConfig,
     payload: WebhookPayload,
 ) -> anyhow::Result<()> {
-    let mut targets = Vec::new();
-
-    if let Some(webhook_url) = cli_config.webhook_url.as_deref().filter(|url| !url.is_empty()) {
-        targets.push(NotificationTarget::Webhook(webhook_url));
-    }
-    if let Some(bark_url) = cli_config.bark_url.as_deref().filter(|url| !url.is_empty()) {
-        targets.push(NotificationTarget::Bark(bark_url));
-    }
-
-    for target in targets {
-        match target {
-            NotificationTarget::Webhook(webhook_url) => {
-                notify_webhook(client, webhook_url, &payload).await?;
-                println!("webhook called {}", webhook_url);
-            }
-            NotificationTarget::Bark(bark_url) => {
-                notify_bark(client, bark_url, &payload).await?;
-                println!("bark called {}", bark_url);
-            }
-        }
+    if let Some(webhook_url) = cli_config
+        .webhook_url
+        .as_deref()
+        .filter(|url| !url.is_empty())
+    {
+        notify_webhook(client, webhook_url, &payload).await?;
+        println!("webhook called {}", webhook_url);
     }
 
     Ok(())
@@ -1446,64 +1670,4 @@ async fn notify_webhook(
     }
 
     Ok(())
-}
-
-async fn notify_bark(client: &CliClient, bark_url: &str, payload: &WebhookPayload) -> anyhow::Result<()> {
-    let (title, body) = bark_message_from_payload(payload);
-    let encoded_title = urlencoding::encode(&title);
-    let encoded_body = urlencoding::encode(&body);
-    let bark_url = format!(
-        "{}/{}/{}",
-        bark_url.trim_end_matches('/'),
-        encoded_title,
-        encoded_body
-    );
-    let response = client
-        .cover_client
-        .get(&bark_url)
-        .send()
-        .await
-        .with_context(|| format!("调用 Bark `{}` 失败", bark_url))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Bark 返回异常状态码({status}): {body}"));
-    }
-
-    Ok(())
-}
-
-fn bark_message_from_payload(payload: &WebhookPayload) -> (String, String) {
-    let title = "manga-downloader".to_string();
-    let body = match payload.status {
-        "success" => build_download_success_message(payload),
-        _ => build_download_failure_message(payload),
-    };
-    (title, body)
-}
-
-fn build_download_success_message(payload: &WebhookPayload) -> String {
-    let mut message = format!(
-        "漫画「{}」已下载完成，共 {} / {} 页。",
-        payload.title, payload.completed_images, payload.total_images
-    );
-    if let Some(zip_path) = payload.zip_path.as_deref().filter(|path| !path.is_empty()) {
-        message.push_str(&format!(" 文件已保存到 {zip_path}。"));
-    }
-    if let Some(comic_id) = payload.comic_id {
-        message.push_str(&format!("\n流水号:{comic_id}"));
-    }
-    message
-}
-
-fn build_download_failure_message(payload: &WebhookPayload) -> String {
-    let reason = payload.reason.as_deref().unwrap_or("未知错误");
-    let mut message = format!(
-        "漫画「{}」下载失败，已完成 {} / {} 页。{}",
-        payload.title, payload.completed_images, payload.total_images, reason
-    );
-    if let Some(comic_id) = payload.comic_id {
-        message.push_str(&format!("\n流水号:{comic_id}"));
-    }
-    message
 }
